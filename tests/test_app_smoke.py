@@ -421,15 +421,28 @@ class HeadlessRoot:
     def __init__(self, events) -> None:
         self.events = events
         self.after_calls = []
+        self.window_state = "normal"
+        self.fail_deiconify = False
 
     def after(self, delay, callback) -> None:
         self.after_calls.append((delay, callback))
 
     def withdraw(self) -> None:
+        self.window_state = "withdrawn"
         self.events.append("withdraw")
 
+    def deiconify(self) -> None:
+        self.events.append("deiconify")
+        if self.fail_deiconify:
+            raise RuntimeError("window restoration unavailable")
+        self.window_state = "normal"
+
     def iconify(self) -> None:
+        self.window_state = "iconic"
         self.events.append("iconify")
+
+    def state(self) -> str:
+        return self.window_state
 
     def destroy(self) -> None:
         self.events.append("destroy")
@@ -460,6 +473,7 @@ def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False, ba
             self._running = False
             self._setup_thread = None
             self._runner_stop = threading.Event()
+            self._backend_error = False
             setattr(self, "_Icon__queue", queue.Queue())
             self.__class__.instances.append(self)
 
@@ -471,6 +485,8 @@ def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False, ba
                 raise RuntimeError("backend unavailable")
             if not backend_returns:
                 self._runner_stop.wait()
+            if self._backend_error:
+                raise RuntimeError("backend terminated")
 
         def run_detached(self, *, setup) -> None:
             raise AssertionError("run_detached must not be used")
@@ -492,6 +508,10 @@ def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False, ba
                 return
             self._running = False
             self.stopped = True
+            self._runner_stop.set()
+
+        def finish_backend(self, *, error=False) -> None:
+            self._backend_error = error
             self._runner_stop.set()
 
         def force_release(self) -> None:
@@ -563,6 +583,117 @@ def test_tray_readiness_controls_when_window_may_withdraw(monkeypatch) -> None:
     app.close_window()
     assert events[-1] == "withdraw"
     assert events.count(("warning", "window.tray_unavailable")) == 1
+
+
+def test_ready_backend_normal_return_disables_tray_withdrawal(monkeypatch) -> None:
+    install_fake_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
+        icon._mark_ready()
+        icon._setup_thread.join(timeout=1)
+        run_root_callback(app.root, 0)
+        assert app._tray_available is True
+
+        icon.finish_backend()
+        state = app._tray_states[id(icon)]
+        assert state.runner_finished.wait(1) is True
+        run_root_callbacks(app.root)
+
+        assert app._tray is None
+        assert app._tray_available is False
+        app.close_window()
+        assert "withdraw" not in events
+    finally:
+        icon.force_release()
+
+
+def test_hidden_window_is_restored_when_ready_backend_returns(monkeypatch) -> None:
+    install_fake_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
+        icon._mark_ready()
+        icon._setup_thread.join(timeout=1)
+        run_root_callback(app.root, 0)
+        app.close_window()
+        assert app.root.state() == "withdrawn"
+
+        icon.finish_backend()
+        state = app._tray_states[id(icon)]
+        assert state.runner_finished.wait(1) is True
+        run_root_callbacks(app.root)
+
+        assert app.root.state() == "normal"
+        assert events.count("deiconify") == 1
+        assert events.count(("warning", "window.tray_unavailable")) == 1
+        assert app.close_hint_label.text == app.text("window.tray_unavailable")
+        app.close_window()
+        assert events.count(("warning", "window.tray_unavailable")) == 1
+    finally:
+        icon.force_release()
+
+
+def test_hidden_window_is_recoverable_when_ready_backend_raises(monkeypatch) -> None:
+    install_fake_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
+        icon._mark_ready()
+        icon._setup_thread.join(timeout=1)
+        run_root_callback(app.root, 0)
+        app.close_window()
+        app.root.fail_deiconify = True
+
+        icon.finish_backend(error=True)
+        state = app._tray_states[id(icon)]
+        assert state.runner_finished.wait(1) is True
+        run_root_callbacks(app.root)
+
+        assert app.root.state() == "iconic"
+        assert events.count("deiconify") == 1
+        assert events.count("iconify") == 1
+        assert events.count(("warning", "window.tray_unavailable")) == 1
+        assert app.close_hint_label.text == app.text("window.tray_unavailable")
+        app.close_window()
+        assert events.count(("warning", "window.tray_unavailable")) == 1
+    finally:
+        icon.force_release()
+
+
+def test_intentional_exit_from_hidden_window_does_not_warn(monkeypatch) -> None:
+    install_fake_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
+        icon._mark_ready()
+        icon._setup_thread.join(timeout=1)
+        run_root_callback(app.root, 0)
+        app.close_window()
+
+        app.exit()
+
+        assert events.count("deiconify") == 0
+        assert events.count(("warning", "window.tray_unavailable")) == 0
+        assert events[-1] == "destroy"
+    finally:
+        icon.force_release()
 
 
 def test_tray_synchronous_startup_failure_never_hides_window(monkeypatch) -> None:

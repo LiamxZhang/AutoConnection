@@ -680,13 +680,14 @@ class DesktopApp:
             if not state.cancelled.is_set():
                 icon.run(setup=self._on_tray_ready)
         except Exception:
-            if not state.cancelled.is_set():
-                try:
-                    self.root.after(0, lambda: self._finish_tray_failure(icon, wait_for_backend=False))
-                except Exception:
-                    self._finish_tray_failure(icon, wait_for_backend=False)
+            pass
         finally:
             state.runner_finished.set()
+        if not state.cancelled.is_set():
+            try:
+                self.root.after(0, lambda: self._finish_tray_failure(icon, wait_for_backend=False))
+            except Exception:
+                self._finish_tray_failure(icon, wait_for_backend=False, recover_hidden_window=False)
 
     def _on_tray_ready(self, icon) -> None:
         state = self._tray_states.get(id(icon))
@@ -720,8 +721,20 @@ class DesktopApp:
             return
         self._tray_available = True
 
-    def _finish_tray_failure(self, icon, *, wait_for_backend: bool = True) -> None:
+    def _finish_tray_failure(
+        self,
+        icon,
+        *,
+        wait_for_backend: bool = True,
+        recover_hidden_window: bool = True,
+    ) -> None:
         state = self._tray_states.get(id(icon)) if icon is not None else None
+        restore_window = (
+            recover_hidden_window
+            and not self._exiting
+            and icon is self._tray
+            and self._tray_available
+        )
         if state is not None:
             state.cancelled.set()
         if icon is self._tray:
@@ -734,6 +747,27 @@ class DesktopApp:
             self._stop_and_join_tray_backend(icon, state)
         elif wait_for_backend and state is not None and not state.runner_finished.is_set():
             self._start_deferred_tray_stop(icon, state)
+        if restore_window:
+            self._restore_window_after_tray_failure()
+
+    def _restore_window_after_tray_failure(self) -> None:
+        try:
+            if self.root.state() != "withdrawn":
+                return
+            self.root.deiconify()
+        except Exception:
+            try:
+                self.root.iconify()
+            except Exception:
+                pass
+        self._show_tray_unavailable_notice()
+
+    def _show_tray_unavailable_notice(self) -> None:
+        if self._tray_notice_shown:
+            return
+        self._tray_notice_shown = True
+        self._show_warning("window.tray_unavailable")
+        self.close_hint_label.configure(text=self.text("window.tray_unavailable"))
 
     def _release_tray_setup_waiter(self, icon) -> None:
         if icon is None:
@@ -814,10 +848,7 @@ class DesktopApp:
         if self._tray_available:
             self.root.withdraw()
             return
-        if not self._tray_notice_shown:
-            self._tray_notice_shown = True
-            self._show_warning("window.tray_unavailable")
-            self.close_hint_label.configure(text=self.text("window.tray_unavailable"))
+        self._show_tray_unavailable_notice()
         self.root.iconify()
 
     def exit(self) -> None:
