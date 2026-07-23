@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -428,6 +429,9 @@ class HeadlessRoot:
     def iconify(self) -> None:
         self.events.append("iconify")
 
+    def destroy(self) -> None:
+        self.events.append("destroy")
+
 
 class HeadlessLabel:
     def __init__(self, events) -> None:
@@ -441,6 +445,8 @@ class HeadlessLabel:
 
 def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False):
     class FakeIcon:
+        instances = []
+
         def __init__(self, name, image, title) -> None:
             self.name = name
             self.image = image
@@ -448,18 +454,41 @@ def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False):
             self.menu = None
             self.setup = None
             self.stopped = False
+            self.visible = False
+            self._running = False
+            self._ready = threading.Event()
+            self._setup_thread = None
+            self.__class__.instances.append(self)
 
         def run_detached(self, *, setup) -> None:
+            self.setup = setup
+            self._setup_thread = threading.Thread(target=self._wait_for_ready, daemon=False)
+            self._setup_thread.start()
             if start_error:
                 raise RuntimeError("backend unavailable")
-            self.setup = setup
+
+        def _wait_for_ready(self) -> None:
+            self._ready.wait()
+            self.setup(self)
+
+        def _mark_ready(self) -> None:
+            self._running = True
+            self._ready.set()
 
         def update_menu(self) -> None:
             if menu_error:
                 raise RuntimeError("menu unavailable")
 
         def stop(self) -> None:
+            if not self._running:
+                return
+            self._running = False
             self.stopped = True
+
+        def force_release(self) -> None:
+            self._ready.set()
+            if self._setup_thread is not None:
+                self._setup_thread.join(timeout=1)
 
     module = SimpleNamespace(
         Icon=FakeIcon,
@@ -482,6 +511,8 @@ def make_headless_tray_app(events):
     app._tray = None
     app._tray_available = False
     app._tray_notice_shown = False
+    app._tray_cancelled = set()
+    app.settings_dialog = None
     app.close_hint_label = HeadlessLabel(events)
     app._show_warning = lambda key: events.append(("warning", key))
     return app
@@ -489,7 +520,8 @@ def make_headless_tray_app(events):
 
 def run_root_callbacks(root) -> None:
     while root.after_calls:
-        _delay, callback = root.after_calls.pop(0)
+        next_index = min(range(len(root.after_calls)), key=lambda index: root.after_calls[index][0])
+        _delay, callback = root.after_calls.pop(next_index)
         callback()
 
 
@@ -509,7 +541,8 @@ def test_tray_readiness_controls_when_window_may_withdraw(monkeypatch) -> None:
         ("label", app.text("window.tray_unavailable")),
         "iconify",
     ]
-    icon.setup(icon)
+    icon._mark_ready()
+    icon._setup_thread.join(timeout=1)
     assert app._tray_available is False
     assert icon.visible is True
     run_root_callbacks(app.root)
@@ -521,19 +554,25 @@ def test_tray_readiness_controls_when_window_may_withdraw(monkeypatch) -> None:
 
 
 def test_tray_synchronous_startup_failure_never_hides_window(monkeypatch) -> None:
-    install_fake_pystray(monkeypatch, start_error=True)
+    fake_icon_type = install_fake_pystray(monkeypatch, start_error=True)
     events = []
     app = make_headless_tray_app(events)
 
     app._start_tray()
-    app.close_window()
-    app.close_window()
+    icon = fake_icon_type.instances[-1]
+    try:
+        assert icon._setup_thread.daemon is False
+        assert icon._setup_thread.is_alive() is False
+        app.close_window()
+        app.close_window()
 
-    assert app._tray is None
-    assert app._tray_available is False
-    assert "withdraw" not in events
-    assert events.count(("warning", "window.tray_unavailable")) == 1
-    assert events.count("iconify") == 2
+        assert app._tray is None
+        assert app._tray_available is False
+        assert "withdraw" not in events
+        assert events.count(("warning", "window.tray_unavailable")) == 1
+        assert events.count("iconify") == 2
+    finally:
+        icon.force_release()
 
 
 def test_tray_setup_menu_failure_never_marks_ready(monkeypatch) -> None:
@@ -546,7 +585,8 @@ def test_tray_setup_menu_failure_never_marks_ready(monkeypatch) -> None:
     assert app._tray_available is False
     app.close_window()
     assert "withdraw" not in events
-    icon.setup(icon)
+    icon._mark_ready()
+    icon._setup_thread.join(timeout=1)
     run_root_callbacks(app.root)
 
     assert app._tray is None
@@ -554,6 +594,41 @@ def test_tray_setup_menu_failure_never_marks_ready(monkeypatch) -> None:
     assert icon.stopped is True
     app.close_window()
     assert "withdraw" not in events
+
+
+def test_tray_pre_readiness_backend_death_is_timed_out_and_joined(monkeypatch) -> None:
+    install_fake_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        assert icon._setup_thread.is_alive() is True
+        run_root_callbacks(app.root)
+
+        assert app._tray is None
+        assert app._tray_available is False
+        assert icon._setup_thread.is_alive() is False
+    finally:
+        icon.force_release()
+
+
+def test_exit_before_tray_readiness_joins_setup_waiter(monkeypatch) -> None:
+    install_fake_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        assert icon._setup_thread.is_alive() is True
+        app.exit()
+
+        assert icon._setup_thread.is_alive() is False
+        assert events[-1] == "destroy"
+    finally:
+        icon.force_release()
 
 
 def test_gui_smoke_builds_compact_bilingual_app(tmp_path) -> None:

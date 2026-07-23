@@ -24,6 +24,8 @@ _RESULT_MESSAGE_KEYS = {
     ConnectionCode.VERIFICATION_FAILED: "error.verification_failed",
     ConnectionCode.INTERNAL_ERROR: "error.internal",
 }
+_TRAY_START_TIMEOUT_MS = 5000
+_TRAY_SETUP_JOIN_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -251,6 +253,7 @@ class DesktopApp:
         self._tray_available = False
         self._tray_notice_shown = False
         self._tray_requested = enable_tray
+        self._tray_cancelled = set()
         self.settings_dialog = None
         self._dialog_original_mode = None
         self._dialog_selected_mode = None
@@ -649,10 +652,13 @@ class DesktopApp:
             self._tray = icon
             self._configure_tray(icon, update_backend=False)
             icon.run_detached(setup=self._on_tray_ready)
+            self.root.after(_TRAY_START_TIMEOUT_MS, lambda: self._expire_tray_startup(icon))
         except Exception:
             self._finish_tray_failure(icon)
 
     def _on_tray_ready(self, icon) -> None:
+        if id(icon) in self._tray_cancelled:
+            return
         try:
             if icon is not self._tray:
                 raise RuntimeError("Tray startup was superseded.")
@@ -663,6 +669,10 @@ class DesktopApp:
             return
         self.root.after(0, lambda: self._finish_tray_ready(icon))
 
+    def _expire_tray_startup(self, icon) -> None:
+        if icon is self._tray and not self._tray_available:
+            self._finish_tray_failure(icon)
+
     def _finish_tray_ready(self, icon) -> None:
         if self._exiting or icon is not self._tray:
             self._stop_tray(icon)
@@ -670,10 +680,36 @@ class DesktopApp:
         self._tray_available = True
 
     def _finish_tray_failure(self, icon) -> None:
+        if icon is not None:
+            self._tray_cancelled.add(id(icon))
         if icon is self._tray:
             self._tray = None
         self._tray_available = False
+        self._release_tray_setup_waiter(icon)
         self._stop_tray(icon)
+        if icon is not None:
+            self._tray_cancelled.discard(id(icon))
+
+    def _release_tray_setup_waiter(self, icon) -> None:
+        if icon is None:
+            return
+        setup_thread = getattr(icon, "_setup_thread", None)
+        if not isinstance(setup_thread, threading.Thread) or not setup_thread.is_alive():
+            return
+
+        # pystray 0.19.5 starts this non-daemon waiter before the backend and stop() is
+        # inert until _mark_ready(). Release that protected gate before joining it.
+        try:
+            icon._mark_ready()
+        except Exception:
+            pass
+        if setup_thread.is_alive():
+            try:
+                getattr(icon, "_Icon__queue").put_nowait(True)
+            except Exception:
+                pass
+        if setup_thread is not threading.current_thread():
+            setup_thread.join(_TRAY_SETUP_JOIN_SECONDS)
 
     @staticmethod
     def _stop_tray(icon) -> None:
@@ -724,12 +760,7 @@ class DesktopApp:
             return
         self._exiting = True
         tray = self._tray
-        self._tray = None
-        if tray is not None:
-            try:
-                tray.stop()
-            except Exception:
-                pass
+        self._finish_tray_failure(tray)
         try:
             self._close_settings_dialog()
             self.root.destroy()
