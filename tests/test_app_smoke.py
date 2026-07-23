@@ -891,6 +891,44 @@ def test_xorg_tray_manager_loss_before_close_uses_fallback(monkeypatch) -> None:
         icon.force_release()
 
 
+def test_xorg_tray_manager_loss_after_withdraw_is_recovered_by_main_poll(monkeypatch) -> None:
+    fake_icon_type = install_fake_pystray(monkeypatch)
+    fake_icon_type.__module__ = "pystray._xorg"
+    events = []
+    app = make_headless_tray_app(events)
+    app.worker = SimpleNamespace(take_result=lambda: None, busy=False)
+    app._credentials_load_pending = False
+
+    app._start_tray()
+    icon = app._tray
+    icon._systray_manager = object()
+    try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
+        icon._mark_ready()
+        icon._setup_thread.join(timeout=1)
+        app._poll_tray_events()
+        app.close_window()
+        state = app._tray_states[id(icon)]
+        assert app.root.state() == "withdrawn"
+        assert state.runner_thread.is_alive() is True
+
+        icon._systray_manager = None
+        app._poll_worker_queue()
+
+        assert app.root.state() == "normal"
+        assert app._tray is None
+        assert app._tray_available is False
+        assert app.close_hint_label.text == app.text("window.tray_unavailable")
+        assert events.count("deiconify") == 1
+        assert events.count(("warning", "window.tray_unavailable")) == 1
+
+        app._poll_worker_queue()
+        assert events.count("deiconify") == 1
+        assert events.count(("warning", "window.tray_unavailable")) == 1
+    finally:
+        icon.force_release()
+
+
 @pytest.mark.parametrize("backend_module", ["pystray._win32", "pystray._appindicator"])
 def test_non_xorg_backends_keep_existing_close_behavior(monkeypatch, backend_module) -> None:
     fake_icon_type = install_fake_pystray(monkeypatch)
@@ -913,6 +951,15 @@ def test_non_xorg_backends_keep_existing_close_behavior(monkeypatch, backend_mod
         assert app._tray is icon
         assert app._tray_available is True
         assert events == ["withdraw"]
+
+        app.worker = SimpleNamespace(take_result=lambda: None, busy=False)
+        app._credentials_load_pending = False
+        app._tray_icon_is_usable = lambda _icon: (_ for _ in ()).throw(
+            AssertionError("non-Xorg backend health was probed")
+        )
+        app._poll_worker_queue()
+        assert app.root.state() == "withdrawn"
+        assert app._tray_available is True
     finally:
         icon.force_release()
 

@@ -427,6 +427,7 @@ class DesktopApp:
         self._poll_tray_events()
         if self._exiting:
             return
+        self._recover_hidden_xorg_tray_failure()
         while True:
             item = self.worker.take_result()
             if item is None:
@@ -465,6 +466,21 @@ class DesktopApp:
             self._tray_events.put(("callback", callback, None))
 
         return queued
+
+    def _recover_hidden_xorg_tray_failure(self) -> None:
+        icon = self._tray
+        if (
+            not self._tray_available
+            or icon is None
+            or type(icon).__module__ != "pystray._xorg"
+        ):
+            return
+        try:
+            root_hidden = self.root.state() == "withdrawn"
+        except Exception:
+            return
+        if root_hidden and not self._tray_icon_is_usable(icon):
+            self._finish_tray_failure(icon, wait_for_backend=False)
 
     def _handle_status_outcome(self, online: bool) -> None:
         self.last_check = self.now_provider()
