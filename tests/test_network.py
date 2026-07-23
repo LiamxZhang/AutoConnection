@@ -78,8 +78,10 @@ def online_response() -> FakeResponse:
     return FakeResponse("Microsoft Connect Test")
 
 
-def make_service(opener: ScriptedOpener, *, clock=lambda: 1, sleep=lambda _: None) -> NetworkService:
-    return NetworkService(opener=opener, clock_ms=clock, sleep=sleep)
+def make_service(
+    opener: ScriptedOpener, *, clock=lambda: 1, sleep=lambda _: None, vpn_detector=lambda: ()
+) -> NetworkService:
+    return NetworkService(opener=opener, clock_ms=clock, sleep=sleep, vpn_detector=vpn_detector)
 
 
 def test_decorated_connectivity_marker_is_online_with_one_get_and_no_post():
@@ -182,6 +184,19 @@ def test_warmup_timeout_returns_portal_unreachable():
     assert probe.closed
 
 
+def test_warmup_timeout_includes_vpn_evidence_once():
+    calls = []
+    opener = ScriptedOpener(offline_response(), TimeoutError("unavailable"))
+
+    result = make_service(opener, vpn_detector=lambda: calls.append(True) or ("tun0",)).connect(
+        Credentials("alice", "secret-value")
+    )
+
+    assert result.code is ConnectionCode.PORTAL_UNREACHABLE
+    assert result.vpn_interfaces == ("tun0",)
+    assert calls == [True]
+
+
 @pytest.mark.parametrize("status", [401, 403])
 def test_post_auth_error_returns_portal_rejected(status: int):
     error = TrackingHTTPError(status)
@@ -191,6 +206,19 @@ def test_post_auth_error_returns_portal_rejected(status: int):
 
     assert result.code is ConnectionCode.PORTAL_REJECTED
     assert error.close_calls == 1
+
+
+def test_portal_rejection_includes_vpn_evidence_once():
+    calls = []
+    opener = ScriptedOpener(offline_response(), FakeResponse("portal page"), FakeResponse('{"success": false}'))
+
+    result = make_service(opener, vpn_detector=lambda: calls.append(True) or ("TAP-Windows",)).connect(
+        Credentials("alice", "secret-value")
+    )
+
+    assert result.code is ConnectionCode.PORTAL_REJECTED
+    assert result.vpn_interfaces == ("TAP-Windows",)
+    assert calls == [True]
 
 
 def test_probe_incomplete_read_returns_offline_and_closes_response():
@@ -305,6 +333,24 @@ def test_completed_post_with_final_offline_probe_returns_verification_failed():
     assert result.code is ConnectionCode.VERIFICATION_FAILED
 
 
+def test_final_verification_failure_includes_vpn_evidence_once():
+    calls = []
+    opener = ScriptedOpener(
+        offline_response(),
+        FakeResponse("portal page"),
+        FakeResponse('{"result": "ok"}'),
+        offline_response(),
+    )
+
+    result = make_service(opener, vpn_detector=lambda: calls.append(True) or ("WireGuard",)).connect(
+        Credentials("alice", "secret-value")
+    )
+
+    assert result.code is ConnectionCode.VERIFICATION_FAILED
+    assert result.vpn_interfaces == ("WireGuard",)
+    assert calls == [True]
+
+
 def test_unexpected_exception_returns_internal_error_without_secret():
     opener = ScriptedOpener(offline_response(), FakeResponse("portal page"))
 
@@ -315,6 +361,81 @@ def test_unexpected_exception_returns_internal_error_without_secret():
     assert result.code is ConnectionCode.INTERNAL_ERROR
     assert "secret-value" not in result.detail
     assert "secret-value" not in repr(result)
+
+
+def test_internal_error_after_connection_attempt_includes_vpn_evidence_once():
+    calls = []
+    opener = ScriptedOpener(offline_response(), FakeResponse("portal page"))
+
+    result = make_service(
+        opener,
+        clock=lambda: (_ for _ in ()).throw(RuntimeError()),
+        vpn_detector=lambda: calls.append(True) or ("tun0",),
+    ).connect(Credentials("alice", "secret-value"))
+
+    assert result.code is ConnectionCode.INTERNAL_ERROR
+    assert result.vpn_interfaces == ("tun0",)
+    assert calls == [True]
+
+
+@pytest.mark.parametrize(
+    "opener, credentials, expected_code",
+    [
+        (ScriptedOpener(online_response()), Credentials("alice", "secret-value"), ConnectionCode.ALREADY_ONLINE),
+        (
+            ScriptedOpener(
+                offline_response(), FakeResponse("portal page"), FakeResponse('{"success": true}'), online_response()
+            ),
+            Credentials("alice", "secret-value"),
+            ConnectionCode.CONNECTED,
+        ),
+        (ScriptedOpener(), Credentials("alice", ""), ConnectionCode.MISSING_CREDENTIALS),
+    ],
+)
+def test_non_attempt_failures_and_successes_do_not_call_vpn_detector(opener, credentials, expected_code):
+    calls = []
+
+    def detector():
+        calls.append(True)
+        return ("tun0",)
+
+    result = make_service(opener, vpn_detector=detector).connect(credentials)
+
+    assert result.code is expected_code
+    assert result.vpn_interfaces == ()
+    assert calls == []
+
+
+def test_vpn_detector_exception_preserves_failed_result():
+    opener = ScriptedOpener(offline_response(), TimeoutError("unavailable"))
+
+    result = make_service(opener, vpn_detector=lambda: (_ for _ in ()).throw(RuntimeError())).connect(
+        Credentials("alice", "secret-value")
+    )
+
+    assert result.code is ConnectionCode.PORTAL_UNREACHABLE
+    assert result.detail == "Portal is unavailable."
+    assert result.vpn_interfaces == ()
+
+
+def test_vpn_detector_discards_non_string_interfaces():
+    opener = ScriptedOpener(offline_response(), TimeoutError("unavailable"))
+
+    result = make_service(opener, vpn_detector=lambda: ("tun0", None, 3, "WireGuard")).connect(
+        Credentials("alice", "secret-value")
+    )
+
+    assert result.vpn_interfaces == ("tun0", "WireGuard")
+
+
+@pytest.mark.parametrize("detector_result", ["tun0", b"tun0"])
+def test_vpn_detector_scalar_values_do_not_become_character_interfaces(detector_result):
+    opener = ScriptedOpener(offline_response(), TimeoutError("unavailable"))
+
+    result = make_service(opener, vpn_detector=lambda: detector_result).connect(Credentials("alice", "secret-value"))
+
+    assert result.code is ConnectionCode.PORTAL_UNREACHABLE
+    assert result.vpn_interfaces == ()
 
 
 def test_failed_result_does_not_expose_credentials_request_or_response(capsys, caplog):
