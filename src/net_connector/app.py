@@ -6,7 +6,6 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 import queue
 import threading
-import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -27,7 +26,6 @@ _RESULT_MESSAGE_KEYS = {
 }
 _TRAY_START_TIMEOUT_MS = 5000
 _TRAY_SETUP_JOIN_SECONDS = 1.0
-_TRAY_DEFERRED_STOP_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -52,6 +50,8 @@ class TrayLifecycle:
 
     backend_ready: threading.Event = field(default_factory=threading.Event)
     cancelled: threading.Event = field(default_factory=threading.Event)
+    runner_finished: threading.Event = field(default_factory=threading.Event)
+    runner_thread: threading.Thread | None = field(default=None, repr=False)
     cleanup_thread: threading.Thread | None = field(default=None, repr=False)
 
 
@@ -661,12 +661,32 @@ class DesktopApp:
             draw.ellipse((25, 25, 39, 39), fill="#ffffff")
             icon = pystray.Icon("net-connector", image, self.text("app.title"))
             self._tray = icon
-            self._tray_states[id(icon)] = TrayLifecycle()
+            state = TrayLifecycle()
+            self._tray_states[id(icon)] = state
             self._configure_tray(icon, update_backend=False)
-            icon.run_detached(setup=self._on_tray_ready)
+            # Icon.run may run off the main thread on the supported Windows/Linux targets.
+            state.runner_thread = threading.Thread(
+                target=self._run_tray_icon,
+                args=(icon, state),
+                daemon=True,
+            )
+            state.runner_thread.start()
             self.root.after(_TRAY_START_TIMEOUT_MS, lambda: self._expire_tray_startup(icon))
         except Exception:
             self._finish_tray_failure(icon, wait_for_backend=False)
+
+    def _run_tray_icon(self, icon, state: TrayLifecycle) -> None:
+        try:
+            if not state.cancelled.is_set():
+                icon.run(setup=self._on_tray_ready)
+        except Exception:
+            if not state.cancelled.is_set():
+                try:
+                    self.root.after(0, lambda: self._finish_tray_failure(icon, wait_for_backend=False))
+                except Exception:
+                    self._finish_tray_failure(icon, wait_for_backend=False)
+        finally:
+            state.runner_finished.set()
 
     def _on_tray_ready(self, icon) -> None:
         state = self._tray_states.get(id(icon))
@@ -711,8 +731,8 @@ class DesktopApp:
         if icon is None:
             return
         if getattr(icon, "_running", False):
-            self._stop_and_join_tray_backend(icon)
-        elif wait_for_backend and state is not None:
+            self._stop_and_join_tray_backend(icon, state)
+        elif wait_for_backend and state is not None and not state.runner_finished.is_set():
             self._start_deferred_tray_stop(icon, state)
 
     def _release_tray_setup_waiter(self, icon) -> None:
@@ -742,26 +762,19 @@ class DesktopApp:
         state.cleanup_thread.start()
 
     def _wait_for_real_tray_readiness(self, icon, state: TrayLifecycle) -> None:
-        deadline = time.monotonic() + _TRAY_DEFERRED_STOP_SECONDS
-        while time.monotonic() < deadline:
+        while not state.runner_finished.is_set():
+            self._release_tray_setup_waiter(icon)
             if getattr(icon, "_running", False):
-                self._stop_and_join_tray_backend(icon)
+                self._stop_and_join_tray_backend(icon, state)
                 return
-            backend_thread = getattr(icon, "_backend_thread", None)
-            if isinstance(backend_thread, threading.Thread) and not backend_thread.is_alive():
-                return
-            time.sleep(0.01)
+            state.runner_finished.wait(0.01)
+        self._release_tray_setup_waiter(icon)
 
-    def _stop_and_join_tray_backend(self, icon) -> None:
+    def _stop_and_join_tray_backend(self, icon, state: TrayLifecycle | None) -> None:
         self._stop_tray(icon)
-        deadline = time.monotonic() + _TRAY_SETUP_JOIN_SECONDS
-        while time.monotonic() < deadline:
-            backend_thread = getattr(icon, "_backend_thread", None) or getattr(icon, "_thread", None)
-            if isinstance(backend_thread, threading.Thread):
-                if backend_thread is not threading.current_thread():
-                    backend_thread.join(max(0.0, deadline - time.monotonic()))
-                return
-            time.sleep(0.01)
+        runner_thread = state.runner_thread if state is not None else None
+        if isinstance(runner_thread, threading.Thread) and runner_thread is not threading.current_thread():
+            runner_thread.join(_TRAY_SETUP_JOIN_SECONDS)
 
     @staticmethod
     def _stop_tray(icon) -> None:

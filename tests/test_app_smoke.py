@@ -6,6 +6,7 @@ import importlib
 import queue
 import sys
 import threading
+import time
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -444,7 +445,7 @@ class HeadlessLabel:
         self.events.append(("label", text))
 
 
-def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False):
+def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False, backend_returns=False):
     class FakeIcon:
         instances = []
 
@@ -458,18 +459,21 @@ def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False):
             self.visible = False
             self._running = False
             self._setup_thread = None
-            self._backend_thread = None
+            self._runner_stop = threading.Event()
             setattr(self, "_Icon__queue", queue.Queue())
             self.__class__.instances.append(self)
 
-        def run_detached(self, *, setup) -> None:
+        def run(self, *, setup) -> None:
             self.setup = setup
             self._setup_thread = threading.Thread(target=self._wait_for_ready, daemon=False)
             self._setup_thread.start()
             if start_error:
                 raise RuntimeError("backend unavailable")
-            self._backend_thread = threading.Thread(target=lambda: None, daemon=False)
-            self._backend_thread.start()
+            if not backend_returns:
+                self._runner_stop.wait()
+
+        def run_detached(self, *, setup) -> None:
+            raise AssertionError("run_detached must not be used")
 
         def _wait_for_ready(self) -> None:
             getattr(self, "_Icon__queue").get()
@@ -488,10 +492,12 @@ def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False):
                 return
             self._running = False
             self.stopped = True
+            self._runner_stop.set()
 
         def force_release(self) -> None:
             getattr(self, "_Icon__queue").put(True)
-            if self._setup_thread is not None:
+            self._runner_stop.set()
+            if self._setup_thread is not None and self._setup_thread.ident is not None:
                 self._setup_thread.join(timeout=1)
 
     module = SimpleNamespace(
@@ -538,6 +544,7 @@ def test_tray_readiness_controls_when_window_may_withdraw(monkeypatch) -> None:
     icon = app._tray
     assert icon is not None
     assert app._tray_available is False
+    assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
 
     app.close_window()
     assert events == [
@@ -566,9 +573,13 @@ def test_tray_synchronous_startup_failure_never_hides_window(monkeypatch) -> Non
     app._start_tray()
     icon = fake_icon_type.instances[-1]
     try:
+        state = app._tray_states[id(icon)]
+        assert state.runner_finished.wait(1) is True
+        run_root_callbacks(app.root)
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
         assert icon._setup_thread.daemon is False
         assert icon._setup_thread.is_alive() is False
-        assert app._tray_states[id(icon)].cleanup_thread is None
+        assert state.cleanup_thread is None
         app.close_window()
         app.close_window()
 
@@ -588,6 +599,7 @@ def test_tray_setup_menu_failure_never_marks_ready(monkeypatch) -> None:
 
     app._start_tray()
     icon = app._tray
+    assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
     assert app._tray_available is False
     app.close_window()
     assert "withdraw" not in events
@@ -603,22 +615,24 @@ def test_tray_setup_menu_failure_never_marks_ready(monkeypatch) -> None:
 
 
 def test_tray_pre_readiness_backend_death_is_timed_out_and_joined(monkeypatch) -> None:
-    install_fake_pystray(monkeypatch)
+    install_fake_pystray(monkeypatch, backend_returns=True)
     events = []
     app = make_headless_tray_app(events)
 
     app._start_tray()
     icon = app._tray
     try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
         assert icon._setup_thread.is_alive() is True
         run_root_callbacks(app.root)
 
         assert app._tray is None
         assert app._tray_available is False
         assert icon._setup_thread.is_alive() is False
-        cleanup_thread = app._tray_states[id(icon)].cleanup_thread
-        cleanup_thread.join(timeout=1)
-        assert cleanup_thread.is_alive() is False
+        state = app._tray_states[id(icon)]
+        assert state.runner_finished.is_set() is True
+        assert state.runner_thread.is_alive() is False
+        assert state.cleanup_thread is None
     finally:
         icon.force_release()
 
@@ -631,6 +645,7 @@ def test_exit_before_tray_readiness_joins_setup_waiter(monkeypatch) -> None:
     app._start_tray()
     icon = app._tray
     try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
         assert icon._setup_thread.is_alive() is True
         app.exit()
 
@@ -661,10 +676,20 @@ def install_late_backend_pystray(monkeypatch):
             self._backend_entered = threading.Event()
             self._backend_stop = threading.Event()
             self._setup_finished = threading.Event()
+            self.run_called = False
+            self.run_detached_called = False
             setattr(self, "_Icon__queue", queue.Queue())
             self.__class__.instances.append(self)
 
+        def run(self, *, setup) -> None:
+            self.run_called = True
+            self._setup = setup
+            self._setup_thread = threading.Thread(target=self._wait_for_ready, daemon=False)
+            self._setup_thread.start()
+            self._run_backend()
+
         def run_detached(self, *, setup) -> None:
+            self.run_detached_called = True
             self._setup = setup
             self._setup_thread = threading.Thread(target=self._wait_for_ready, daemon=False)
             self._backend_thread = threading.Thread(target=self._run_backend, daemon=False)
@@ -712,7 +737,7 @@ def install_late_backend_pystray(monkeypatch):
             self._backend_initialize.set()
             self._backend_stop.set()
             for thread in (self._setup_thread, self._backend_thread):
-                if thread is not None:
+                if thread is not None and thread.ident is not None:
                     thread.join(timeout=1)
 
     module = SimpleNamespace(
@@ -728,6 +753,15 @@ def run_root_callback(root, delay) -> None:
     index = next(index for index, item in enumerate(root.after_calls) if item[0] == delay)
     _delay, callback = root.after_calls.pop(index)
     callback()
+
+
+def wait_until(predicate, timeout=1.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return bool(predicate())
 
 
 def test_watchdog_honors_backend_readiness_before_tk_callback(monkeypatch) -> None:
@@ -752,7 +786,28 @@ def test_watchdog_honors_backend_readiness_before_tk_callback(monkeypatch) -> No
         icon.emergency_cleanup()
 
 
+def test_tray_backend_run_is_owned_by_application_daemon(monkeypatch) -> None:
+    install_late_backend_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        state = app._tray_states[id(icon)]
+        assert icon.run_called is True
+        assert icon.run_detached_called is False
+        assert state.runner_thread is not None
+        assert state.runner_thread.daemon is True
+        assert state.runner_thread.is_alive() is True
+    finally:
+        icon.emergency_cleanup()
+
+
 def test_watchdog_cancellation_never_fabricates_readiness_and_stops_late_backend(monkeypatch) -> None:
+    from net_connector import app as app_module
+
+    assert not hasattr(app_module, "_TRAY_DEFERRED_STOP_SECONDS")
     install_late_backend_pystray(monkeypatch)
     events = []
     app = make_headless_tray_app(events)
@@ -761,16 +816,19 @@ def test_watchdog_cancellation_never_fabricates_readiness_and_stops_late_backend
     icon = app._tray
     try:
         run_root_callback(app.root, 5000)
-        assert icon._setup_thread.is_alive() is False
+        assert wait_until(lambda: icon._setup_thread is not None and not icon._setup_thread.is_alive()) is True
         assert icon.false_ready_calls == 0
+        state = app._tray_states[id(icon)]
+        cleanup_thread = state.cleanup_thread
+        cleanup_thread.join(timeout=0.05)
+        assert cleanup_thread.is_alive() is True
 
         icon.initialize_backend()
         assert icon._backend_entered.wait(1) is True
-        icon._backend_thread.join(timeout=1)
+        state.runner_thread.join(timeout=1)
 
         assert icon.stopped is True
-        assert icon._backend_thread.is_alive() is False
-        cleanup_thread = app._tray_states[id(icon)].cleanup_thread
+        assert state.runner_thread.is_alive() is False
         cleanup_thread.join(timeout=1)
         assert cleanup_thread.is_alive() is False
     finally:
@@ -786,15 +844,18 @@ def test_exit_before_readiness_stops_and_joins_late_backend(monkeypatch) -> None
     icon = app._tray
     try:
         app.exit()
-        assert icon._setup_thread.is_alive() is False
+        assert wait_until(lambda: icon._setup_thread is not None and not icon._setup_thread.is_alive()) is True
         assert icon.false_ready_calls == 0
+        state = app._tray_states[id(icon)]
+        assert state.runner_thread.daemon is True
+        assert state.runner_thread.is_alive() is True
 
         icon.initialize_backend()
         assert icon._backend_entered.wait(1) is True
-        icon._backend_thread.join(timeout=1)
+        state.runner_thread.join(timeout=1)
 
         assert icon.stopped is True
-        assert icon._backend_thread.is_alive() is False
+        assert state.runner_thread.is_alive() is False
         assert events[-1] == "destroy"
         cleanup_thread = app._tray_states[id(icon)].cleanup_thread
         cleanup_thread.join(timeout=1)
