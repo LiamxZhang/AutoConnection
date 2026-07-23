@@ -612,6 +612,42 @@ def test_ready_backend_normal_return_disables_tray_withdrawal(monkeypatch) -> No
         icon.force_release()
 
 
+def test_close_after_runner_finishes_before_failure_callback_uses_fallback(monkeypatch) -> None:
+    install_fake_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
+        icon._mark_ready()
+        icon._setup_thread.join(timeout=1)
+        run_root_callback(app.root, 0)
+        assert app._tray_available is True
+
+        icon.finish_backend()
+        state = app._tray_states[id(icon)]
+        assert state.runner_finished.wait(1) is True
+        assert wait_until(lambda: any(delay == 0 for delay, _callback in app.root.after_calls)) is True
+
+        app.close_window()
+
+        assert events == [
+            ("warning", "window.tray_unavailable"),
+            ("label", app.text("window.tray_unavailable")),
+            "iconify",
+        ]
+        assert app._tray is None
+        assert app._tray_available is False
+
+        run_root_callbacks(app.root)
+        assert events.count(("warning", "window.tray_unavailable")) == 1
+        assert "withdraw" not in events
+    finally:
+        icon.force_release()
+
+
 def test_hidden_window_is_restored_when_ready_backend_returns(monkeypatch) -> None:
     install_fake_pystray(monkeypatch)
     events = []

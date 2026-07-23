@@ -845,9 +845,14 @@ class DesktopApp:
         self.root.lift()
 
     def close_window(self) -> None:
-        if self._tray_available:
+        icon = self._tray
+        state = self._tray_states.get(id(icon)) if icon is not None else None
+        runner_finished = state is not None and state.runner_finished.is_set()
+        if self._tray_available and not runner_finished:
             self.root.withdraw()
             return
+        if self._tray_available:
+            self._finish_tray_failure(icon, wait_for_backend=False)
         self._show_tray_unavailable_notice()
         self.root.iconify()
 
