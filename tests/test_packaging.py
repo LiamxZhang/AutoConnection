@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -55,6 +56,195 @@ def workflow_step(job, name: str):
 
 def workflow_runs(job) -> list[str]:
     return [step["run"] for step in job["steps"] if "run" in step]
+
+
+ALLOWED_RELEASE_ASSETS = {
+    "WorkNetConnector-windows-x86_64.exe",
+    "WorkNetConnector-linux-x86_64",
+    "SHA256SUMS.txt",
+}
+
+FAKE_GH_PROGRAM = r'''import json
+import os
+from pathlib import Path
+import sys
+
+state_path = Path(os.environ["FAKE_GH_STATE"])
+state = json.loads(state_path.read_text(encoding="utf-8"))
+args = sys.argv[1:]
+state["calls"].append(args)
+
+
+def save():
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+
+def event(kind, **values):
+    state["events"].append({"kind": kind, **values})
+
+
+if args[:2] == ["release", "view"]:
+    save()
+    raise SystemExit(0 if state["release"] is not None else 1)
+
+if args[:2] == ["release", "create"]:
+    if "--draft" not in args:
+        raise SystemExit("release was not created as a draft")
+    state["release"] = "draft"
+    event("create")
+    save()
+    raise SystemExit(0)
+
+if args[:2] == ["release", "edit"]:
+    draft_flag = next((value for value in args if value.startswith("--draft=")), None)
+    if draft_flag == "--draft=true":
+        state["release"] = "draft"
+        event("draft")
+    elif draft_flag == "--draft=false":
+        state["release"] = "published"
+        event("publish")
+    else:
+        raise SystemExit("missing draft transition")
+    save()
+    raise SystemExit(0)
+
+if args and args[0] == "api":
+    if "--method" in args:
+        method_index = args.index("--method")
+        if args[method_index + 1] != "DELETE":
+            raise SystemExit("unexpected API method")
+        endpoint = args[-1]
+        asset_id = endpoint.rsplit("/", 1)[-1]
+        if not asset_id.isdigit():
+            raise SystemExit("non-numeric delete endpoint")
+        numeric_id = int(asset_id)
+        state["assets"] = [asset for asset in state["assets"] if asset["id"] != numeric_id]
+        event("delete", id=numeric_id)
+        save()
+        raise SystemExit(0)
+    rows = "".join(f'{asset["id"]}\t{asset["name"]}\n' for asset in state["assets"])
+    sys.stdout.buffer.write(rows.encode("utf-8"))
+    save()
+    raise SystemExit(0)
+
+if args[:2] == ["release", "upload"]:
+    event("upload")
+    if state.get("upload_fail"):
+        save()
+        raise SystemExit(42)
+    uploaded = [value for value in args[3:] if value != "--clobber"]
+    allowed = {
+        "WorkNetConnector-windows-x86_64.exe",
+        "WorkNetConnector-linux-x86_64",
+        "SHA256SUMS.txt",
+    }
+    if set(uploaded) != allowed or "--clobber" not in args:
+        raise SystemExit("unexpected upload contract")
+    state["assets"] = [asset for asset in state["assets"] if asset["name"] not in allowed]
+    next_id = max([asset["id"] for asset in state["assets"] if isinstance(asset["id"], int)] + [1000]) + 1
+    for offset, name in enumerate(sorted(allowed)):
+        state["assets"].append({"id": next_id + offset, "name": name})
+    save()
+    raise SystemExit(0)
+
+save()
+raise SystemExit(f"unexpected fake gh command: {args!r}")
+'''
+
+
+def find_test_bash() -> str:
+    candidates = [shutil.which("bash")]
+    if os.name == "nt":
+        candidates.extend(
+            [
+                r"C:\Program Files\Git\bin\bash.exe",
+                r"C:\Program Files\Git\usr\bin\bash.exe",
+            ]
+        )
+    for candidate in candidates:
+        if not candidate or not Path(candidate).is_file():
+            continue
+        probe = subprocess.run(
+            [candidate, "--version"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return candidate
+    pytest.skip("A usable POSIX Bash is unavailable")
+
+
+def make_fake_release_runner(tmp_path: Path, initial_state: dict):
+    workflow = load_workflow(RELEASE_WORKFLOW)
+    publish = workflow["jobs"]["publish"]
+    release_script = workflow_step(publish, "Synchronize and publish release")["run"]
+    fake_program = tmp_path / "fake_gh.py"
+    fake_program.write_text(FAKE_GH_PROGRAM, encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        '#!/usr/bin/env bash\nexec python "$FAKE_GH_SCRIPT" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    state_path = tmp_path / "state.json"
+    state = {
+        "release": None,
+        "assets": [],
+        "events": [],
+        "calls": [],
+        "upload_fail": False,
+        **initial_state,
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    release_assets = tmp_path / "release-assets"
+    release_assets.mkdir()
+    for filename in ALLOWED_RELEASE_ASSETS:
+        (release_assets / filename).write_bytes(b"portable-artifact")
+    wrapper = tmp_path / "run-release.sh"
+    wrapper.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+if command -v cygpath >/dev/null 2>&1; then
+  export PATH="$(cygpath -u "$FAKE_GH_BIN"):$PATH"
+else
+  export PATH="$FAKE_GH_BIN:$PATH"
+fi
+"""
+        + release_script,
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "FAKE_GH_BIN": str(fake_bin),
+            "FAKE_GH_SCRIPT": str(fake_program),
+            "FAKE_GH_STATE": str(state_path),
+            "GITHUB_REF_NAME": "v1.2.3",
+            "GH_REPO": "example/work-net-connector",
+            "GH_TOKEN": "fake-token-for-offline-test",
+        }
+    )
+    bash = find_test_bash()
+
+    def run():
+        result = subprocess.run(
+            [bash, wrapper.as_posix()],
+            cwd=release_assets,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+        return result, json.loads(state_path.read_text(encoding="utf-8"))
+
+    return run
 
 
 def target_metadata() -> dict[str, tuple[bool, int | None]]:
@@ -371,28 +561,133 @@ def test_release_workflow_publishes_one_release_with_exact_checksums() -> None:
         "WorkNetConnector-linux-x86_64 > SHA256SUMS.txt"
     )
 
-    ensure = workflow_step(publish, "Ensure release exists")["run"]
-    assert 'if ! gh release view "$GITHUB_REF_NAME"' in ensure
-    assert 'gh release create "$GITHUB_REF_NAME"' in ensure
-    assert "--draft" in ensure
-    synchronize = workflow_step(publish, "Synchronize release assets")["run"]
+    synchronize = workflow_step(publish, "Synchronize and publish release")["run"]
+    assert 'if ! gh release view "$GITHUB_REF_NAME"' in synchronize
+    assert 'gh release create "$GITHUB_REF_NAME"' in synchronize
+    assert "--draft" in synchronize
+    draft_transition = 'gh release edit "$GITHUB_REF_NAME" --draft=true'
+    assert draft_transition in synchronize
+    assert synchronize.index(draft_transition) < synchronize.index("gh api")
+    assert "[0-9]+" in synchronize
+    assert 'gh api --method DELETE "repos/$GH_REPO/releases/assets/$asset_id"' in synchronize
+    assert "gh release delete-asset" not in synchronize
     for filename in (
         "WorkNetConnector-windows-x86_64.exe",
         "WorkNetConnector-linux-x86_64",
         "SHA256SUMS.txt",
     ):
         assert filename in synchronize
-    assert "gh release delete-asset" in synchronize
+    assert "gh api --method DELETE" in synchronize
     assert "gh release upload" in synchronize
     assert "--clobber" in synchronize
-    publish_step = workflow_step(publish, "Publish release")["run"]
-    assert 'gh release edit "$GITHUB_REF_NAME"' in publish_step
-    assert "--draft=false" in publish_step
+    publish_transition = 'gh release edit "$GITHUB_REF_NAME" --draft=false'
+    assert publish_transition in synchronize
+    assert synchronize.index("gh release upload") < synchronize.index(publish_transition)
 
     publish_commands = "\n".join(workflow_runs(publish))
     assert publish_commands.count("gh release create") == 1
     assert publish_commands.count("gh release upload") == 1
-    assert publish_commands.count("gh release edit") == 1
+    assert publish_commands.count("gh release edit") == 2
+
+
+def test_published_release_is_drafted_before_adversarial_assets_are_deleted(tmp_path: Path) -> None:
+    adversarial_assets = [
+        {"id": 11, "name": "--help"},
+        {"id": 12, "name": "name with spaces"},
+        {"id": 13, "name": "$(touch injected)"},
+        {"id": 14, "name": "quote'\"; echo injected"},
+    ]
+    run = make_fake_release_runner(
+        tmp_path,
+        {
+            "release": "published",
+            "assets": adversarial_assets
+            + [{"id": 15 + index, "name": name} for index, name in enumerate(ALLOWED_RELEASE_ASSETS)],
+        },
+    )
+
+    result, state = run()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert state["events"][0] == {"kind": "draft"}
+    assert [event["id"] for event in state["events"] if event["kind"] == "delete"] == [
+        11,
+        12,
+        13,
+        14,
+    ]
+    assert state["events"][-1] == {"kind": "publish"}
+    assert state["release"] == "published"
+    assert {asset["name"] for asset in state["assets"]} == ALLOWED_RELEASE_ASSETS
+    command_arguments = "\0".join(argument for call in state["calls"] for argument in call)
+    for asset in adversarial_assets:
+        assert asset["name"] not in command_arguments
+    delete_calls = [call for call in state["calls"] if call[:3] == ["api", "--method", "DELETE"]]
+    assert all(re.fullmatch(r"repos/example/work-net-connector/releases/assets/\d+", call[-1]) for call in delete_calls)
+
+
+def test_upload_failure_leaves_existing_release_as_draft(tmp_path: Path) -> None:
+    run = make_fake_release_runner(
+        tmp_path,
+        {"release": "published", "upload_fail": True},
+    )
+
+    result, state = run()
+
+    assert result.returncode != 0
+    assert state["events"][0] == {"kind": "draft"}
+    assert state["events"][-1] == {"kind": "upload"}
+    assert all(event["kind"] != "publish" for event in state["events"])
+    assert state["release"] == "draft"
+
+
+def test_missing_release_is_created_as_draft_then_published(tmp_path: Path) -> None:
+    run = make_fake_release_runner(tmp_path, {"release": None})
+
+    result, state = run()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [event["kind"] for event in state["events"]] == [
+        "create",
+        "draft",
+        "upload",
+        "publish",
+    ]
+    assert state["release"] == "published"
+    assert {asset["name"] for asset in state["assets"]} == ALLOWED_RELEASE_ASSETS
+
+
+def test_release_publish_rerun_is_idempotent(tmp_path: Path) -> None:
+    run = make_fake_release_runner(tmp_path, {"release": "published"})
+
+    first_result, first_state = run()
+    first_event_count = len(first_state["events"])
+    second_result, second_state = run()
+
+    assert first_result.returncode == 0, first_result.stdout + first_result.stderr
+    assert second_result.returncode == 0, second_result.stdout + second_result.stderr
+    assert [event["kind"] for event in second_state["events"][first_event_count:]] == [
+        "draft",
+        "upload",
+        "publish",
+    ]
+    assert second_state["release"] == "published"
+    assert {asset["name"] for asset in second_state["assets"]} == ALLOWED_RELEASE_ASSETS
+
+
+def test_non_numeric_asset_id_stops_before_delete_or_upload(tmp_path: Path) -> None:
+    run = make_fake_release_runner(
+        tmp_path,
+        {"release": "published", "assets": [{"id": "not-numeric", "name": "--help"}]},
+    )
+
+    result, state = run()
+
+    assert result.returncode != 0
+    assert state["release"] == "draft"
+    assert state["events"] == [{"kind": "draft"}]
+    assert all(call[:3] != ["api", "--method", "DELETE"] for call in state["calls"])
+    assert all(call[:2] != ["release", "upload"] for call in state["calls"])
 
 
 def test_readme_documents_safe_portable_operation_and_development() -> None:

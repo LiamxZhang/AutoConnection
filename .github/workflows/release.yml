@@ -94,30 +94,30 @@ jobs:
         working-directory: release-assets
         run: sha256sum WorkNetConnector-windows-x86_64.exe WorkNetConnector-linux-x86_64 > SHA256SUMS.txt
 
-      - name: Ensure release exists
+      - name: Synchronize and publish release
         working-directory: release-assets
         run: |
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
           fi
+          gh release edit "$GITHUB_REF_NAME" --draft=true --title "$GITHUB_REF_NAME"
 
-      - name: Synchronize release assets
-        working-directory: release-assets
-        run: |
-          asset_names="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"
-          while IFS= read -r asset; do
-            [[ -z "$asset" ]] && continue
-            case "$asset" in
+          asset_rows="$(gh api "repos/$GH_REPO/releases/tags/$GITHUB_REF_NAME" --jq '.assets[] | [.id, .name] | @tsv')"
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ -z "$asset_id" && -z "$asset_name" ]] && continue
+            if [[ ! "$asset_id" =~ ^[0-9]+$ ]]; then
+              printf 'Invalid release asset id; refusing deletion.\n' >&2
+              exit 1
+            fi
+            case "$asset_name" in
               WorkNetConnector-windows-x86_64.exe|WorkNetConnector-linux-x86_64|SHA256SUMS.txt) ;;
-              *) gh release delete-asset "$GITHUB_REF_NAME" "$asset" --yes ;;
+              *) gh api --method DELETE "repos/$GH_REPO/releases/assets/$asset_id" ;;
             esac
-          done <<< "$asset_names"
+          done <<< "$asset_rows"
+
           gh release upload "$GITHUB_REF_NAME" \
             WorkNetConnector-windows-x86_64.exe \
             WorkNetConnector-linux-x86_64 \
             SHA256SUMS.txt \
             --clobber
-
-      - name: Publish release
-        working-directory: release-assets
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false --title "$GITHUB_REF_NAME"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --title "$GITHUB_REF_NAME"
