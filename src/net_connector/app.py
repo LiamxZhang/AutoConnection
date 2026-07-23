@@ -596,7 +596,7 @@ class DesktopApp:
         self.password_entry = ttk.Entry(body, textvariable=self.password_var, show="•")
         self.password_entry.grid(row=1, column=1, sticky="ew", pady=(0, 12))
         self._track_credential_edits()
-        self.show_password_button = ttk.Button(body, width=9, command=self._toggle_password)
+        self.show_password_button = ttk.Button(body, width=13, command=self._toggle_password)
         self.show_password_button.grid(row=1, column=2, padx=(8, 0), pady=(0, 12))
         self.credential_hint_label = ttk.Label(body, foreground="#68736e")
         self.credential_hint_label.grid(row=2, column=1, columnspan=2, sticky="w", pady=(0, 18))

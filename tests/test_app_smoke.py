@@ -1500,6 +1500,9 @@ def test_gui_smoke_builds_compact_bilingual_app(tmp_path) -> None:
         assert str(app.language_combobox.cget("state")) == "readonly"
         assert len(app.language_combobox.cget("values")) == 3
         assert str(app.password_entry.cget("show")) == "•"
+        assert int(app.show_password_button.cget("width")) >= len(
+            app.text("action.show_password")
+        )
 
         app.preview_language("zh")
         root.update_idletasks()
