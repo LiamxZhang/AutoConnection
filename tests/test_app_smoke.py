@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import queue
 import sys
 import threading
 from datetime import datetime
@@ -456,8 +457,9 @@ def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False):
             self.stopped = False
             self.visible = False
             self._running = False
-            self._ready = threading.Event()
             self._setup_thread = None
+            self._backend_thread = None
+            setattr(self, "_Icon__queue", queue.Queue())
             self.__class__.instances.append(self)
 
         def run_detached(self, *, setup) -> None:
@@ -466,14 +468,16 @@ def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False):
             self._setup_thread.start()
             if start_error:
                 raise RuntimeError("backend unavailable")
+            self._backend_thread = threading.Thread(target=lambda: None, daemon=False)
+            self._backend_thread.start()
 
         def _wait_for_ready(self) -> None:
-            self._ready.wait()
+            getattr(self, "_Icon__queue").get()
             self.setup(self)
 
         def _mark_ready(self) -> None:
             self._running = True
-            self._ready.set()
+            getattr(self, "_Icon__queue").put(True)
 
         def update_menu(self) -> None:
             if menu_error:
@@ -486,7 +490,7 @@ def install_fake_pystray(monkeypatch, *, start_error=False, menu_error=False):
             self.stopped = True
 
         def force_release(self) -> None:
-            self._ready.set()
+            getattr(self, "_Icon__queue").put(True)
             if self._setup_thread is not None:
                 self._setup_thread.join(timeout=1)
 
@@ -511,7 +515,7 @@ def make_headless_tray_app(events):
     app._tray = None
     app._tray_available = False
     app._tray_notice_shown = False
-    app._tray_cancelled = set()
+    app._tray_states = {}
     app.settings_dialog = None
     app.close_hint_label = HeadlessLabel(events)
     app._show_warning = lambda key: events.append(("warning", key))
@@ -544,8 +548,9 @@ def test_tray_readiness_controls_when_window_may_withdraw(monkeypatch) -> None:
     icon._mark_ready()
     icon._setup_thread.join(timeout=1)
     assert app._tray_available is False
-    assert icon.visible is True
+    assert icon.visible is False
     run_root_callbacks(app.root)
+    assert icon.visible is True
     assert app._tray_available is True
 
     app.close_window()
@@ -563,6 +568,7 @@ def test_tray_synchronous_startup_failure_never_hides_window(monkeypatch) -> Non
     try:
         assert icon._setup_thread.daemon is False
         assert icon._setup_thread.is_alive() is False
+        assert app._tray_states[id(icon)].cleanup_thread is None
         app.close_window()
         app.close_window()
 
@@ -610,6 +616,9 @@ def test_tray_pre_readiness_backend_death_is_timed_out_and_joined(monkeypatch) -
         assert app._tray is None
         assert app._tray_available is False
         assert icon._setup_thread.is_alive() is False
+        cleanup_thread = app._tray_states[id(icon)].cleanup_thread
+        cleanup_thread.join(timeout=1)
+        assert cleanup_thread.is_alive() is False
     finally:
         icon.force_release()
 
@@ -629,6 +638,169 @@ def test_exit_before_tray_readiness_joins_setup_waiter(monkeypatch) -> None:
         assert events[-1] == "destroy"
     finally:
         icon.force_release()
+
+
+def install_late_backend_pystray(monkeypatch):
+    class LateBackendIcon:
+        instances = []
+
+        def __init__(self, name, image, title) -> None:
+            self.name = name
+            self.image = image
+            self.title = title
+            self.menu = None
+            self.visible = False
+            self.stopped = False
+            self.false_ready_calls = 0
+            self._running = False
+            self._hwnd = None
+            self._setup = None
+            self._setup_thread = None
+            self._backend_thread = None
+            self._backend_initialize = threading.Event()
+            self._backend_entered = threading.Event()
+            self._backend_stop = threading.Event()
+            self._setup_finished = threading.Event()
+            setattr(self, "_Icon__queue", queue.Queue())
+            self.__class__.instances.append(self)
+
+        def run_detached(self, *, setup) -> None:
+            self._setup = setup
+            self._setup_thread = threading.Thread(target=self._wait_for_ready, daemon=False)
+            self._backend_thread = threading.Thread(target=self._run_backend, daemon=False)
+            self._setup_thread.start()
+            self._backend_thread.start()
+
+        def _wait_for_ready(self) -> None:
+            getattr(self, "_Icon__queue").get()
+            self._setup(self)
+            self._setup_finished.set()
+
+        def _run_backend(self) -> None:
+            self._backend_initialize.wait()
+            self._hwnd = object()
+            self._mark_ready()
+            self._backend_entered.set()
+            self._backend_stop.wait()
+
+        def _mark_ready(self) -> None:
+            if self._hwnd is None:
+                self.false_ready_calls += 1
+            self._running = True
+            try:
+                self.update_menu()
+            finally:
+                getattr(self, "_Icon__queue").put(True)
+
+        def update_menu(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            if not self._running:
+                return
+            if self._hwnd is None:
+                raise RuntimeError("uninitialized window handle")
+            self.stopped = True
+            self._running = False
+            self._backend_stop.set()
+
+        def initialize_backend(self) -> None:
+            self._backend_initialize.set()
+
+        def emergency_cleanup(self) -> None:
+            getattr(self, "_Icon__queue").put(True)
+            self._backend_initialize.set()
+            self._backend_stop.set()
+            for thread in (self._setup_thread, self._backend_thread):
+                if thread is not None:
+                    thread.join(timeout=1)
+
+    module = SimpleNamespace(
+        Icon=LateBackendIcon,
+        Menu=lambda *items: tuple(items),
+        MenuItem=lambda text, callback, **kwargs: (text, callback, kwargs),
+    )
+    monkeypatch.setitem(sys.modules, "pystray", module)
+    return LateBackendIcon
+
+
+def run_root_callback(root, delay) -> None:
+    index = next(index for index, item in enumerate(root.after_calls) if item[0] == delay)
+    _delay, callback = root.after_calls.pop(index)
+    callback()
+
+
+def test_watchdog_honors_backend_readiness_before_tk_callback(monkeypatch) -> None:
+    install_late_backend_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        icon.initialize_backend()
+        assert icon._setup_finished.wait(1) is True
+        assert app._tray_available is False
+
+        run_root_callback(app.root, 5000)
+
+        assert app._tray is icon
+        assert icon.stopped is False
+        run_root_callback(app.root, 0)
+        assert app._tray_available is True
+    finally:
+        icon.emergency_cleanup()
+
+
+def test_watchdog_cancellation_never_fabricates_readiness_and_stops_late_backend(monkeypatch) -> None:
+    install_late_backend_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        run_root_callback(app.root, 5000)
+        assert icon._setup_thread.is_alive() is False
+        assert icon.false_ready_calls == 0
+
+        icon.initialize_backend()
+        assert icon._backend_entered.wait(1) is True
+        icon._backend_thread.join(timeout=1)
+
+        assert icon.stopped is True
+        assert icon._backend_thread.is_alive() is False
+        cleanup_thread = app._tray_states[id(icon)].cleanup_thread
+        cleanup_thread.join(timeout=1)
+        assert cleanup_thread.is_alive() is False
+    finally:
+        icon.emergency_cleanup()
+
+
+def test_exit_before_readiness_stops_and_joins_late_backend(monkeypatch) -> None:
+    install_late_backend_pystray(monkeypatch)
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        app.exit()
+        assert icon._setup_thread.is_alive() is False
+        assert icon.false_ready_calls == 0
+
+        icon.initialize_backend()
+        assert icon._backend_entered.wait(1) is True
+        icon._backend_thread.join(timeout=1)
+
+        assert icon.stopped is True
+        assert icon._backend_thread.is_alive() is False
+        assert events[-1] == "destroy"
+        cleanup_thread = app._tray_states[id(icon)].cleanup_thread
+        cleanup_thread.join(timeout=1)
+        assert cleanup_thread.is_alive() is False
+    finally:
+        icon.emergency_cleanup()
 
 
 def test_gui_smoke_builds_compact_bilingual_app(tmp_path) -> None:

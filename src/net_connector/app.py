@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -26,6 +27,7 @@ _RESULT_MESSAGE_KEYS = {
 }
 _TRAY_START_TIMEOUT_MS = 5000
 _TRAY_SETUP_JOIN_SECONDS = 1.0
+_TRAY_DEFERRED_STOP_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,15 @@ class CredentialLoadOutcome:
 
     credentials: Credentials | None = field(default=None, repr=False)
     failed: bool = False
+
+
+@dataclass
+class TrayLifecycle:
+    """Thread-safe readiness and cancellation state for one tray icon."""
+
+    backend_ready: threading.Event = field(default_factory=threading.Event)
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    cleanup_thread: threading.Thread | None = field(default=None, repr=False)
 
 
 def result_message_key(result: ConnectionResult) -> str:
@@ -253,7 +264,7 @@ class DesktopApp:
         self._tray_available = False
         self._tray_notice_shown = False
         self._tray_requested = enable_tray
-        self._tray_cancelled = set()
+        self._tray_states = {}
         self.settings_dialog = None
         self._dialog_original_mode = None
         self._dialog_selected_mode = None
@@ -650,27 +661,37 @@ class DesktopApp:
             draw.ellipse((25, 25, 39, 39), fill="#ffffff")
             icon = pystray.Icon("net-connector", image, self.text("app.title"))
             self._tray = icon
+            self._tray_states[id(icon)] = TrayLifecycle()
             self._configure_tray(icon, update_backend=False)
             icon.run_detached(setup=self._on_tray_ready)
             self.root.after(_TRAY_START_TIMEOUT_MS, lambda: self._expire_tray_startup(icon))
         except Exception:
-            self._finish_tray_failure(icon)
+            self._finish_tray_failure(icon, wait_for_backend=False)
 
     def _on_tray_ready(self, icon) -> None:
-        if id(icon) in self._tray_cancelled:
+        state = self._tray_states.get(id(icon))
+        if state is None or state.cancelled.is_set():
+            return
+        state.backend_ready.set()
+        try:
+            self.root.after(0, lambda: self._complete_tray_ready(icon, state))
+        except Exception:
+            self._finish_tray_failure(icon)
+
+    def _complete_tray_ready(self, icon, state: TrayLifecycle) -> None:
+        if state.cancelled.is_set() or icon is not self._tray or self._exiting:
             return
         try:
-            if icon is not self._tray:
-                raise RuntimeError("Tray startup was superseded.")
             self._configure_tray(icon, update_backend=True)
             icon.visible = True
         except Exception:
-            self.root.after(0, lambda: self._finish_tray_failure(icon))
+            self._finish_tray_failure(icon)
             return
-        self.root.after(0, lambda: self._finish_tray_ready(icon))
+        self._finish_tray_ready(icon)
 
     def _expire_tray_startup(self, icon) -> None:
-        if icon is self._tray and not self._tray_available:
+        state = self._tray_states.get(id(icon))
+        if icon is self._tray and not self._tray_available and not (state and state.backend_ready.is_set()):
             self._finish_tray_failure(icon)
 
     def _finish_tray_ready(self, icon) -> None:
@@ -679,16 +700,20 @@ class DesktopApp:
             return
         self._tray_available = True
 
-    def _finish_tray_failure(self, icon) -> None:
-        if icon is not None:
-            self._tray_cancelled.add(id(icon))
+    def _finish_tray_failure(self, icon, *, wait_for_backend: bool = True) -> None:
+        state = self._tray_states.get(id(icon)) if icon is not None else None
+        if state is not None:
+            state.cancelled.set()
         if icon is self._tray:
             self._tray = None
         self._tray_available = False
         self._release_tray_setup_waiter(icon)
-        self._stop_tray(icon)
-        if icon is not None:
-            self._tray_cancelled.discard(id(icon))
+        if icon is None:
+            return
+        if getattr(icon, "_running", False):
+            self._stop_and_join_tray_backend(icon)
+        elif wait_for_backend and state is not None:
+            self._start_deferred_tray_stop(icon, state)
 
     def _release_tray_setup_waiter(self, icon) -> None:
         if icon is None:
@@ -697,19 +722,46 @@ class DesktopApp:
         if not isinstance(setup_thread, threading.Thread) or not setup_thread.is_alive():
             return
 
-        # pystray 0.19.5 starts this non-daemon waiter before the backend and stop() is
-        # inert until _mark_ready(). Release that protected gate before joining it.
+        # pystray 0.19.5 exposes no public pre-ready cancellation. Release only
+        # its setup queue; calling _mark_ready() would fabricate backend state.
         try:
-            icon._mark_ready()
+            getattr(icon, "_Icon__queue").put_nowait(True)
         except Exception:
-            pass
-        if setup_thread.is_alive():
-            try:
-                getattr(icon, "_Icon__queue").put_nowait(True)
-            except Exception:
-                pass
+            return
         if setup_thread is not threading.current_thread():
             setup_thread.join(_TRAY_SETUP_JOIN_SECONDS)
+
+    def _start_deferred_tray_stop(self, icon, state: TrayLifecycle) -> None:
+        if state.cleanup_thread is not None and state.cleanup_thread.is_alive():
+            return
+        state.cleanup_thread = threading.Thread(
+            target=self._wait_for_real_tray_readiness,
+            args=(icon, state),
+            daemon=True,
+        )
+        state.cleanup_thread.start()
+
+    def _wait_for_real_tray_readiness(self, icon, state: TrayLifecycle) -> None:
+        deadline = time.monotonic() + _TRAY_DEFERRED_STOP_SECONDS
+        while time.monotonic() < deadline:
+            if getattr(icon, "_running", False):
+                self._stop_and_join_tray_backend(icon)
+                return
+            backend_thread = getattr(icon, "_backend_thread", None)
+            if isinstance(backend_thread, threading.Thread) and not backend_thread.is_alive():
+                return
+            time.sleep(0.01)
+
+    def _stop_and_join_tray_backend(self, icon) -> None:
+        self._stop_tray(icon)
+        deadline = time.monotonic() + _TRAY_SETUP_JOIN_SECONDS
+        while time.monotonic() < deadline:
+            backend_thread = getattr(icon, "_backend_thread", None) or getattr(icon, "_thread", None)
+            if isinstance(backend_thread, threading.Thread):
+                if backend_thread is not threading.current_thread():
+                    backend_thread.join(max(0.0, deadline - time.monotonic()))
+                return
+            time.sleep(0.01)
 
     @staticmethod
     def _stop_tray(icon) -> None:
