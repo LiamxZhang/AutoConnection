@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "net-connector"
+version = "0.1.0"
+description = "Portable desktop network connector"
+requires-python = ">=3.12"
+dependencies = [
+    "keyring>=25.6,<26",
+    "psutil>=7,<8",
+    "pystray>=0.19.5,<0.20",
+    "Pillow>=11,<12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-cov>=6,<7",
+    "pyinstaller>=6.14,<7",
+]
+
+[project.gui-scripts]
+net-connector = "net_connector.__main__:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.setuptools.packages.find]
+where = ["src"]
