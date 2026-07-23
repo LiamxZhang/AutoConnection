@@ -220,6 +220,16 @@ class CredentialStore:
             raise CredentialError("Stored credentials are invalid.")
         return Credentials(username, password)
 
+    def delete(self) -> None:
+        """Delete the fixed credential entry for transaction compensation."""
+        backend_failed = False
+        try:
+            self._keyring.delete_password(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)
+        except Exception:
+            backend_failed = True
+        if backend_failed:
+            raise CredentialError("Credential storage is unavailable.")
+
     def _validate_backend(self) -> None:
         """Reject configured keyring backends that cannot securely store secrets."""
         backend_invalid = False

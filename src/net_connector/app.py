@@ -26,6 +26,7 @@ _RESULT_MESSAGE_KEYS = {
 }
 _TRAY_START_TIMEOUT_MS = 5000
 _TRAY_SETUP_JOIN_SECONDS = 1.0
+_CREDENTIALS_UNLOADED = object()
 
 
 @dataclass(frozen=True)
@@ -262,12 +263,16 @@ class DesktopApp:
         self._dialog_original_mode = None
         self._dialog_selected_mode = None
         self._credentials_load_pending = False
+        self._committed_credentials = _CREDENTIALS_UNLOADED
+        self._credential_snapshot_failed = False
+        self._scheduled_connection_pending = False
         self._credential_fields_dirty = {"username": False, "password": False}
         self._applying_loaded_credentials = False
 
         self._configure_root()
         self._configure_styles()
         self._build_main_ui()
+        self.root.bind("<Configure>", self._on_root_configure, add=True)
         self.refresh_text()
         self.root.protocol("WM_DELETE_WINDOW", self.close_window)
         self.root.after(75, self._poll_worker_queue)
@@ -282,8 +287,27 @@ class DesktopApp:
     def _configure_root(self) -> None:
         self.root.geometry("420x390")
         self.root.minsize(420, 390)
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
         self.root.configure(background="#f7f8f7")
+
+    @staticmethod
+    def _fit_window_to_content(window, base_width: int, base_height: int) -> None:
+        window.update_idletasks()
+        window.minsize(
+            max(base_width, window.winfo_reqwidth()),
+            max(base_height, window.winfo_reqheight()),
+        )
+
+    def _fit_root_to_content(self) -> None:
+        if not self._exiting:
+            self._fit_window_to_content(self.root, 420, 390)
+
+    def _on_root_configure(self, event) -> None:
+        if event.widget is not self.root:
+            return
+        self.status_label.configure(wraplength=max(180, event.width - 112))
+        self.close_hint_label.configure(wraplength=max(200, event.width - 60))
+        self._fit_root_to_content()
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -380,6 +404,7 @@ class DesktopApp:
         self._render_schedule()
         self._refresh_dialog_text()
         self._refresh_tray()
+        self._fit_root_to_content()
 
     def _render_status(self) -> None:
         kwargs = {}
@@ -403,6 +428,7 @@ class DesktopApp:
         self._status_interfaces = tuple(interfaces)
         self.status_dot.itemconfigure(self._dot_item, fill=self._DOT_COLORS[color])
         self._render_status()
+        self._fit_root_to_content()
 
     def _start_status_check(self) -> None:
         if self.worker.start_status_check():
@@ -443,6 +469,7 @@ class DesktopApp:
             dialog = self.settings_dialog
             if dialog is not None and dialog.winfo_exists() and self.worker.start_credentials_load():
                 self._credentials_load_pending = False
+        self._start_pending_scheduled_connection()
         self.root.after(75, self._poll_worker_queue)
 
     def _poll_tray_events(self) -> None:
@@ -502,8 +529,11 @@ class DesktopApp:
         if self.settings_dialog is None or not self.settings_dialog.winfo_exists():
             return
         if outcome.failed:
+            self._credential_snapshot_failed = True
             self._show_error("error.credential_store", parent=self.settings_dialog)
             return
+        self._committed_credentials = outcome.credentials
+        self._credential_snapshot_failed = False
         if outcome.credentials is not None:
             self._applying_loaded_credentials = True
             try:
@@ -532,9 +562,24 @@ class DesktopApp:
             except ScheduleError:
                 due = False
             if due:
-                self.start_connection()
+                self._scheduled_connection_pending = True
+            self._start_pending_scheduled_connection()
             self._render_schedule()
+        else:
+            self._scheduled_connection_pending = False
         self.root.after(1000, self._poll_schedule)
+
+    def _start_pending_scheduled_connection(self) -> bool:
+        if (
+            not self._scheduled_connection_pending
+            or self.worker.busy
+            or self._credentials_load_pending
+        ):
+            return False
+        # Consuming before admission prevents a failed thread start or a
+        # terminal connection result from becoming a 75 ms retry loop.
+        self._scheduled_connection_pending = False
+        return self.start_connection()
 
     def _apply_schedule_edit(self, _event=None) -> None:
         previous_settings = self.settings
@@ -557,6 +602,7 @@ class DesktopApp:
             return
         self.settings = updated
         self.scheduler = scheduler
+        self._scheduled_connection_pending = False
         self._render_schedule()
 
     def _restore_schedule_widgets(self, settings: Settings, scheduler) -> None:
@@ -574,11 +620,13 @@ class DesktopApp:
         self._dialog_original_mode = self.settings.language
         self._dialog_selected_mode = self.settings.language
         self._credential_fields_dirty = {"username": False, "password": False}
+        self._committed_credentials = _CREDENTIALS_UNLOADED
+        self._credential_snapshot_failed = False
         dialog = tk.Toplevel(self.root)
         self.settings_dialog = dialog
         dialog.geometry("420x340")
         dialog.minsize(420, 340)
-        dialog.resizable(False, False)
+        dialog.resizable(True, True)
         dialog.transient(self.root)
         dialog.protocol("WM_DELETE_WINDOW", self.cancel_settings)
         body = ttk.Frame(dialog, padding=(24, 18))
@@ -614,6 +662,7 @@ class DesktopApp:
         self.save_button = ttk.Button(actions, width=10, command=self.save_settings)
         self.save_button.pack(side="left")
         self._refresh_dialog_text()
+        self._fit_window_to_content(dialog, 420, 340)
         dialog.grab_set()
         self.username_entry.focus_set()
         self._credentials_load_pending = not self.worker.start_credentials_load()
@@ -636,6 +685,7 @@ class DesktopApp:
         self.language_combobox.configure(values=options)
         mode = self._dialog_selected_mode or self.settings.language
         self.language_var.set(options[("system", "zh", "en").index(mode)])
+        self._fit_window_to_content(dialog, 420, 340)
 
     def _toggle_password(self) -> None:
         self.password_entry.configure(show="" if self.password_entry.cget("show") else "•")
@@ -665,19 +715,40 @@ class DesktopApp:
         if not username or not password.strip():
             self._show_error("error.missing_credentials", parent=self.settings_dialog)
             return
+        previous_credentials = self._committed_credentials
+        if previous_credentials is _CREDENTIALS_UNLOADED:
+            key = "error.credential_store" if self._credential_snapshot_failed else "error.busy"
+            self._show_error(key, parent=self.settings_dialog)
+            return
         mode = self._dialog_selected_mode or self.settings.language
         updated = replace(self.settings, language=mode)
         try:
-            self.credential_store_factory().save(Credentials(username, password))
+            credential_store = self.credential_store_factory()
+            credentials = Credentials(username, password)
+            credential_store.save(credentials)
         except Exception:
             self._show_error("error.credential_store", parent=self.settings_dialog)
             return
         try:
             self.settings_store.save(updated)
         except Exception:
-            self._show_error("error.settings_save", parent=self.settings_dialog)
+            rollback_failed = False
+            try:
+                if previous_credentials is None:
+                    credential_store.delete()
+                else:
+                    credential_store.save(previous_credentials)
+            except Exception:
+                rollback_failed = True
+            if rollback_failed:
+                self._committed_credentials = _CREDENTIALS_UNLOADED
+                self._credential_snapshot_failed = True
+                self._show_error("error.settings_rollback", parent=self.settings_dialog)
+            else:
+                self._show_error("error.settings_save", parent=self.settings_dialog)
             return
         self.settings = updated
+        self._committed_credentials = credentials
         self._close_settings_dialog()
         self.refresh_text()
 
@@ -687,6 +758,8 @@ class DesktopApp:
         self._dialog_original_mode = None
         self._dialog_selected_mode = None
         self._credentials_load_pending = False
+        self._committed_credentials = _CREDENTIALS_UNLOADED
+        self._credential_snapshot_failed = False
         if dialog is not None and dialog.winfo_exists():
             try:
                 dialog.grab_release()

@@ -41,7 +41,8 @@ _CATALOGS: dict[str, dict[str, str]] = {
         "error.verification_failed": "连接验证失败",
         "error.vpn_detected": "检测到 VPN 或隧道接口（{interfaces}），可能阻碍工作门户连接。请断开后重试。",
         "error.internal": "发生内部错误", "error.settings_recovered": "设置已恢复为默认值",
-        "error.settings_save": "无法保存设置", "error.busy": "连接操作正在进行",
+        "error.settings_save": "无法保存设置", "error.settings_rollback": "设置未保存，且无法恢复原凭据",
+        "error.busy": "连接操作正在进行",
         "dialog.error": "错误", "dialog.info": "提示", "dialog.credentials_required": "需要凭据",
     },
     "en": {
@@ -72,7 +73,9 @@ _CATALOGS: dict[str, dict[str, str]] = {
         "error.verification_failed": "Connection verification failed",
         "error.vpn_detected": "Detected VPN or tunnel interfaces ({interfaces}) may block the work portal. Disconnect them and retry.",
         "error.internal": "An internal error occurred", "error.settings_recovered": "Settings were restored to defaults",
-        "error.settings_save": "Unable to save settings", "error.busy": "A connection operation is already in progress",
+        "error.settings_save": "Unable to save settings",
+        "error.settings_rollback": "Settings were not saved and previous credentials could not be restored",
+        "error.busy": "A connection operation is already in progress",
         "dialog.error": "Error", "dialog.info": "Information", "dialog.credentials_required": "Credentials required",
     },
 }

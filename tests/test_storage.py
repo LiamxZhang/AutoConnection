@@ -21,8 +21,10 @@ class FakeKeyring:
     def __init__(self):
         self.entries = {}
         self.set_calls = []
+        self.delete_calls = []
         self.get_error = None
         self.set_error = None
+        self.delete_error = None
 
     def set_password(self, service, account, value):
         self.set_calls.append((service, account, value))
@@ -34,6 +36,12 @@ class FakeKeyring:
         if self.get_error:
             raise self.get_error
         return self.entries.get((service, account))
+
+    def delete_password(self, service, account):
+        self.delete_calls.append((service, account))
+        if self.delete_error:
+            raise self.delete_error
+        del self.entries[(service, account)]
 
 
 class ZeroPriorityKeyring(FakeKeyring):
@@ -270,6 +278,29 @@ def test_credential_store_round_trips_fixed_json_entry():
 
 def test_missing_credential_entry_returns_none():
     assert CredentialStore(FakeKeyring()).load() is None
+
+
+def test_delete_removes_the_fixed_keyring_entry():
+    backend = FakeKeyring()
+    backend.entries[(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)] = "dummy-entry"
+
+    CredentialStore(backend).delete()
+
+    assert backend.delete_calls == [(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)]
+    assert backend.entries == {}
+
+
+def test_delete_backend_error_is_generic_and_has_no_context(capsys, caplog):
+    backend = FakeKeyring()
+    backend.delete_error = RuntimeError("backend delete diagnostic")
+
+    with pytest.raises(CredentialError) as raised:
+        CredentialStore(backend).delete()
+
+    captured = capsys.readouterr()
+    assert raised.value.__context__ is None
+    assert "backend delete diagnostic" not in str(raised.value)
+    assert captured.out + captured.err + caplog.text == ""
 
 
 def test_empty_credentials_do_not_call_backend():

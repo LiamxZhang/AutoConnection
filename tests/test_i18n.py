@@ -26,7 +26,8 @@ REQUIRED_KEYS = {
     "tray.show", "tray.connect", "tray.exit",
     "error.missing_credentials", "error.credential_store", "error.portal_unreachable",
     "error.portal_rejected", "error.verification_failed", "error.vpn_detected",
-    "error.internal", "error.settings_recovered", "error.settings_save", "error.busy",
+    "error.internal", "error.settings_recovered", "error.settings_save",
+    "error.settings_rollback", "error.busy",
     "dialog.error", "dialog.info", "dialog.credentials_required",
 }
 

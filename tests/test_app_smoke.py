@@ -324,6 +324,150 @@ def test_persist_schedule_save_failure_does_not_mutate_existing_settings() -> No
     assert store.saved == []
 
 
+class SchedulingWorker:
+    def __init__(self, operation=None) -> None:
+        self.busy = operation is not None
+        self.operation = operation
+        self.results = []
+        self.connection_starts = 1 if operation == "connect" else 0
+        self.credential_load_starts = 1 if operation == "credentials" else 0
+
+    def start_connection(self) -> bool:
+        if self.busy:
+            return False
+        self.busy = True
+        self.operation = "connect"
+        self.connection_starts += 1
+        return True
+
+    def start_credentials_load(self) -> bool:
+        if self.busy:
+            return False
+        self.busy = True
+        self.operation = "credentials"
+        self.credential_load_starts += 1
+        return True
+
+    def complete(self, outcome) -> None:
+        self.results.append((self.operation, outcome))
+
+    def take_result(self):
+        if not self.results:
+            return None
+        self.busy = False
+        self.operation = None
+        return self.results.pop(0)
+
+
+class PollingRoot:
+    def __init__(self) -> None:
+        self.after_calls = []
+
+    def after(self, delay, callback) -> None:
+        self.after_calls.append((delay, callback))
+
+
+def make_scheduled_app(worker, now):
+    from net_connector.app import DesktopApp
+    from net_connector.scheduler import DailyScheduler
+
+    app = DesktopApp.__new__(DesktopApp)
+    app._exiting = False
+    app.worker = worker
+    app.root = PollingRoot()
+    app.scheduler = DailyScheduler("08:30", datetime(2026, 7, 23, 8, 0))
+    app.now_provider = lambda: now[0]
+    app._scheduled_connection_pending = False
+    app._credentials_load_pending = False
+    app.settings_dialog = None
+    app._poll_tray_events = lambda: None
+    app._recover_hidden_xorg_tray_failure = lambda: None
+    app._render_schedule = lambda: None
+    app._handle_status_outcome = lambda outcome: None
+    app._handle_connection_outcome = lambda outcome: None
+    app._handle_credentials_outcome = lambda outcome: None
+    app._failed = False
+    app._set_busy = lambda *_args, **_kwargs: None
+    return app
+
+
+@pytest.mark.parametrize(
+    ("operation", "due_time", "outcome"),
+    [
+        ("status", datetime(2026, 7, 23, 8, 30), False),
+        ("connect", datetime(2026, 7, 23, 8, 30), SimpleNamespace()),
+        ("status", datetime(2026, 7, 23, 14, 0), False),
+    ],
+    ids=["startup-status", "manual-connect", "sleep-catch-up"],
+)
+def test_due_schedule_waits_for_busy_worker_then_starts_exactly_once(
+    operation,
+    due_time,
+    outcome,
+) -> None:
+    worker = SchedulingWorker(operation)
+    initial_starts = worker.connection_starts
+    now = [due_time]
+    app = make_scheduled_app(worker, now)
+
+    app._poll_schedule()
+
+    assert app._scheduled_connection_pending is True
+    assert worker.connection_starts == initial_starts
+    worker.complete(outcome)
+    app._poll_worker_queue()
+
+    assert app._scheduled_connection_pending is False
+    assert worker.connection_starts == initial_starts + 1
+    app._poll_worker_queue()
+    app._poll_schedule()
+    assert worker.connection_starts == initial_starts + 1
+
+
+def test_due_schedule_waits_for_credential_load_before_starting() -> None:
+    from net_connector.app import CredentialLoadOutcome
+
+    worker = SchedulingWorker("credentials")
+    app = make_scheduled_app(worker, [datetime(2026, 7, 23, 8, 30)])
+
+    app._poll_schedule()
+    assert app._scheduled_connection_pending is True
+    assert worker.connection_starts == 0
+
+    worker.complete(CredentialLoadOutcome())
+    app._poll_worker_queue()
+
+    assert app._scheduled_connection_pending is False
+    assert worker.connection_starts == 1
+
+
+@pytest.mark.parametrize(
+    ("enabled", "schedule_time"),
+    [(False, "08:30"), (True, "10:30")],
+    ids=["disable", "reschedule"],
+)
+def test_schedule_edit_cancels_a_stale_pending_occurrence(enabled, schedule_time) -> None:
+    from net_connector.storage import Settings
+
+    worker = SchedulingWorker("connect")
+    app = make_scheduled_app(worker, [datetime(2026, 7, 23, 8, 30)])
+    app.settings = Settings(schedule_enabled=True, schedule_time="08:30")
+    app.settings_store = RecordingSettingsStore()
+    app.schedule_enabled_var = ScalarVar(enabled)
+    app.schedule_time_var = ScalarVar(schedule_time)
+    app._show_error = lambda *_args, **_kwargs: None
+
+    app._poll_schedule()
+    assert app._scheduled_connection_pending is True
+
+    app._apply_schedule_edit()
+
+    assert app._scheduled_connection_pending is False
+    worker.complete(SimpleNamespace())
+    app._poll_worker_queue()
+    assert worker.connection_starts == 1
+
+
 def test_tray_callback_only_queues_for_main_thread() -> None:
     from net_connector.app import DesktopApp
 
@@ -444,12 +588,12 @@ def test_slow_credential_load_preserves_dirty_field_and_populates_untouched(
         "password": dirty_field == "password",
     }
 
-    app._handle_credentials_outcome(
-        CredentialLoadOutcome(Credentials("saved-user", "saved-password"))
-    )
+    committed = Credentials("saved-user", "saved-password")
+    app._handle_credentials_outcome(CredentialLoadOutcome(committed))
 
     assert app.username_var.get() == expected_username
     assert app.password_var.get() == expected_password
+    assert app._committed_credentials is committed
 
 
 @pytest.mark.parametrize("dirty_field", ["username", "password"])
@@ -490,7 +634,14 @@ class FakeSettingsDialog:
         self.exists = False
 
 
-def make_save_settings_app(events, *, credential_error=None, settings_error=None):
+def make_save_settings_app(
+    events,
+    *,
+    credential_error=None,
+    settings_error=None,
+    rollback_error=None,
+    previous_credentials=Credentials("previous-user", "previous-secret"),
+):
     from net_connector.app import DesktopApp
     from net_connector.i18n import Translator
     from net_connector.storage import Settings
@@ -498,12 +649,22 @@ def make_save_settings_app(events, *, credential_error=None, settings_error=None
     class SavingCredentialStore:
         def __init__(self) -> None:
             self.saved = []
+            self.deleted = 0
 
         def save(self, credentials) -> None:
-            events.append("credentials")
-            if credential_error is not None:
+            restoring = bool(self.saved)
+            events.append("credentials:restore" if restoring else "credentials:new")
+            if not restoring and credential_error is not None:
                 raise credential_error
+            if restoring and rollback_error is not None:
+                raise rollback_error
             self.saved.append(credentials)
+
+        def delete(self) -> None:
+            events.append("credentials:delete")
+            if rollback_error is not None:
+                raise rollback_error
+            self.deleted += 1
 
     class SavingSettingsStore:
         def __init__(self) -> None:
@@ -529,6 +690,8 @@ def make_save_settings_app(events, *, credential_error=None, settings_error=None
     app._dialog_original_mode = "en"
     app._dialog_selected_mode = "zh"
     app._credentials_load_pending = False
+    app._committed_credentials = previous_credentials
+    app._credential_snapshot_failed = False
     app.translator = Translator("zh")
     app._show_error = lambda key, **_kwargs: errors.append(key)
     app.refresh_text = lambda: events.append("refresh")
@@ -536,10 +699,37 @@ def make_save_settings_app(events, *, credential_error=None, settings_error=None
 
 
 @pytest.mark.parametrize(
+    ("snapshot_failed", "expected_error"),
+    [(False, "error.busy"), (True, "error.credential_store")],
+)
+def test_save_settings_waits_for_a_known_committed_credential_snapshot(
+    snapshot_failed,
+    expected_error,
+) -> None:
+    from net_connector.app import _CREDENTIALS_UNLOADED
+
+    events = []
+    app, _credential_store, _settings_store, dialog, errors = make_save_settings_app(events)
+    app._committed_credentials = _CREDENTIALS_UNLOADED
+    app._credential_snapshot_failed = snapshot_failed
+
+    app.save_settings()
+
+    assert events == []
+    assert errors == [expected_error]
+    assert app.settings_dialog is dialog
+    assert dialog.winfo_exists() is True
+
+
+@pytest.mark.parametrize(
     ("failure_point", "expected_events", "expected_error"),
     [
-        ("credentials", ["credentials"], "error.credential_store"),
-        ("settings", ["credentials", "settings"], "error.settings_save"),
+        ("credentials", ["credentials:new"], "error.credential_store"),
+        (
+            "settings",
+            ["credentials:new", "settings", "credentials:restore"],
+            "error.settings_save",
+        ),
     ],
 )
 def test_save_settings_failures_are_redacted_and_keep_dialog_state(
@@ -581,7 +771,7 @@ def test_save_settings_persists_credentials_before_settings_and_closes_dialog() 
 
     app.save_settings()
 
-    assert events == ["credentials", "settings", "refresh"]
+    assert events == ["credentials:new", "settings", "refresh"]
     assert credential_store.saved == [Credentials("demo-user", "save-secret")]
     assert settings_store.saved == [app.settings]
     assert app.settings.language == "zh"
@@ -592,6 +782,71 @@ def test_save_settings_persists_credentials_before_settings_and_closes_dialog() 
     assert dialog.released is True
     assert dialog.winfo_exists() is False
     assert errors == []
+
+
+def test_settings_failure_restores_previously_committed_credentials() -> None:
+    previous = Credentials("previous-user", "previous-secret")
+    events = []
+    app, credential_store, settings_store, dialog, errors = make_save_settings_app(
+        events,
+        settings_error=RuntimeError("disk unavailable"),
+        previous_credentials=previous,
+    )
+
+    app.save_settings()
+
+    assert events == ["credentials:new", "settings", "credentials:restore"]
+    assert credential_store.saved == [Credentials("demo-user", "save-secret"), previous]
+    assert settings_store.saved == []
+    assert app._committed_credentials is previous
+    assert errors == ["error.settings_save"]
+    assert app.settings_dialog is dialog
+    assert dialog.winfo_exists() is True
+
+
+def test_settings_failure_deletes_new_credentials_when_none_existed() -> None:
+    events = []
+    app, credential_store, settings_store, dialog, errors = make_save_settings_app(
+        events,
+        settings_error=RuntimeError("disk unavailable"),
+        previous_credentials=None,
+    )
+
+    app.save_settings()
+
+    assert events == ["credentials:new", "settings", "credentials:delete"]
+    assert credential_store.deleted == 1
+    assert settings_store.saved == []
+    assert app._committed_credentials is None
+    assert errors == ["error.settings_save"]
+    assert app.settings_dialog is dialog
+
+
+@pytest.mark.parametrize("previous_credentials", [Credentials("previous-user", "previous-secret"), None])
+def test_settings_rollback_failure_is_reported_safely_and_keeps_dialog(
+    previous_credentials,
+    capsys,
+    caplog,
+) -> None:
+    secret = "rollback-diagnostic-secret"
+    events = []
+    app, _credential_store, _settings_store, dialog, errors = make_save_settings_app(
+        events,
+        settings_error=RuntimeError("settings diagnostic"),
+        rollback_error=RuntimeError(secret),
+        previous_credentials=previous_credentials,
+    )
+
+    app.save_settings()
+
+    expected_rollback = "credentials:restore" if previous_credentials is not None else "credentials:delete"
+    assert events == ["credentials:new", "settings", expected_rollback]
+    assert errors == ["error.settings_rollback"]
+    assert app._credential_snapshot_failed is True
+    assert app.settings_dialog is dialog
+    assert dialog.winfo_exists() is True
+    captured = capsys.readouterr()
+    assert secret not in repr(errors) + captured.out + captured.err + caplog.text
 
 
 def test_apply_schedule_edit_rolls_back_ui_store_and_scheduler(tmp_path, monkeypatch) -> None:
@@ -792,6 +1047,7 @@ def make_headless_tray_app(events):
     app._tray_states = {}
     app._tray_events = queue.Queue()
     app.settings_dialog = None
+    app._scheduled_connection_pending = False
     app.close_hint_label = HeadlessLabel(events)
     app._show_warning = lambda key: events.append(("warning", key))
     return app
@@ -1493,10 +1749,15 @@ def test_gui_smoke_builds_compact_bilingual_app(tmp_path) -> None:
         assert app.schedule_checkbutton.winfo_exists()
         assert app.schedule_time_entry.winfo_exists()
         assert root.minsize()[0] >= 420
+        assert tuple(root.resizable()) == (1, 1)
+        assert root.geometry().startswith("420x390")
 
         app.open_settings()
         root.update_idletasks()
         assert app.settings_dialog is not None
+        assert tuple(app.settings_dialog.resizable()) == (1, 1)
+        assert app.settings_dialog.minsize()[0] >= 420
+        assert app.settings_dialog.minsize()[1] >= 340
         assert str(app.language_combobox.cget("state")) == "readonly"
         assert len(app.language_combobox.cget("values")) == 3
         assert str(app.password_entry.cget("show")) == "•"
@@ -1516,6 +1777,74 @@ def test_gui_smoke_builds_compact_bilingual_app(tmp_path) -> None:
         assert root.title() == "Network Connector"
         assert app.settings.language == "system"
     finally:
+        if app is not None:
+            app.exit()
+        else:
+            root.destroy()
+
+
+def test_scaled_windows_expand_to_fit_long_status_and_settings(tmp_path) -> None:
+    import tkinter as tk
+
+    from net_connector.app import DesktopApp
+    from net_connector.storage import SettingsStore
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as error:
+        pytest.skip(f"Tk display unavailable: {error}")
+
+    root.withdraw()
+    original_scaling = float(root.tk.call("tk", "scaling"))
+    root.tk.call("tk", "scaling", original_scaling * 1.5)
+    app = None
+    try:
+        app = DesktopApp(
+            root,
+            settings_store=SettingsStore(tmp_path / "settings.json"),
+            credential_store_factory=lambda: FakeCredentialStore(),
+            network_service=FakeNetwork(),
+            auto_status_check=False,
+            enable_tray=False,
+        )
+        app._set_status(
+            "error.vpn_detected",
+            "failed",
+            interfaces=(
+                "Corporate VPN Connection With A Long Interface Name",
+                "Secondary Encrypted Tunnel Adapter",
+            ),
+        )
+        root.deiconify()
+        root.update_idletasks()
+        root.update()
+
+        assert tuple(root.resizable()) == (1, 1)
+        assert root.winfo_width() >= root.winfo_reqwidth()
+        assert root.winfo_height() >= root.winfo_reqheight()
+        assert root.minsize()[0] >= root.winfo_reqwidth()
+        assert root.minsize()[1] >= root.winfo_reqheight()
+        assert app.status_label.winfo_height() >= app.status_label.winfo_reqheight()
+
+        app.open_settings()
+        root.update_idletasks()
+        root.update()
+        dialog = app.settings_dialog
+        assert dialog is not None
+        assert tuple(dialog.resizable()) == (1, 1)
+        assert dialog.winfo_width() >= dialog.winfo_reqwidth()
+        assert dialog.winfo_height() >= dialog.winfo_reqheight()
+        assert dialog.minsize()[0] >= dialog.winfo_reqwidth()
+        assert dialog.minsize()[1] >= dialog.winfo_reqheight()
+
+        app.preview_language("zh")
+        app._close_settings_dialog()
+        root.update_idletasks()
+        root.update()
+        assert root.winfo_height() >= root.winfo_reqheight()
+        assert root.minsize()[1] >= root.winfo_reqheight()
+    finally:
+        root.tk.call("tk", "scaling", original_scaling)
         if app is not None:
             app.exit()
         else:
