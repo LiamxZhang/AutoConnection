@@ -324,22 +324,75 @@ def test_persist_schedule_save_failure_does_not_mutate_existing_settings() -> No
     assert store.saved == []
 
 
-def test_tray_callback_only_marshals_to_root_after() -> None:
-    from net_connector.app import marshal_to_tk
+def test_tray_callback_only_queues_for_main_thread() -> None:
+    from net_connector.app import DesktopApp
 
     calls = []
-
-    class FakeRoot:
-        def after(self, delay, callback):
-            calls.append((delay, callback))
+    app = DesktopApp.__new__(DesktopApp)
+    app._tray_events = queue.Queue()
 
     def ui_callback():
         calls.append("ui")
 
-    callback = marshal_to_tk(FakeRoot(), ui_callback)
-    callback("tray-icon", "menu-item")
+    callback = app._queue_tray_callback(ui_callback)
+    tray_thread = threading.Thread(target=callback, args=("tray-icon", "menu-item"))
+    tray_thread.start()
+    tray_thread.join(timeout=1)
 
-    assert calls == [(0, ui_callback)]
+    assert calls == []
+    assert app._tray_events.empty() is False
+    app._poll_tray_events()
+    assert calls == ["ui"]
+
+
+def test_queued_exit_stops_worker_polling_and_rescheduling() -> None:
+    from net_connector.app import DesktopApp
+
+    class ForbiddenWorker:
+        def take_result(self):
+            raise AssertionError("worker polled after exit")
+
+    app = DesktopApp.__new__(DesktopApp)
+    app._exiting = False
+    app._tray_events = queue.Queue()
+    app._tray_events.put(("callback", lambda: setattr(app, "_exiting", True), None))
+    app._tray_events.put(
+        ("callback", lambda: (_ for _ in ()).throw(AssertionError("callback ran after exit")), None)
+    )
+    app.worker = ForbiddenWorker()
+    app.root = SimpleNamespace(
+        after=lambda *_args: (_ for _ in ()).throw(AssertionError("poller rescheduled after exit"))
+    )
+
+    app._poll_worker_queue()
+
+    assert app._exiting is True
+
+
+def test_tray_polling_error_does_not_block_hidden_window_recovery() -> None:
+    from net_connector.app import TrayLifecycle
+
+    events = []
+    app = make_headless_tray_app(events)
+    app.root.withdraw()
+    events.clear()
+    icon = SimpleNamespace(visible=True, _running=False)
+    state = TrayLifecycle()
+    state.runner_finished.set()
+    app._tray = icon
+    app._tray_available = True
+    app._tray_states[id(icon)] = state
+    app._tray_events.put(
+        ("callback", lambda: (_ for _ in ()).throw(RuntimeError("tray command failed")), None)
+    )
+    app._tray_events.put(("failed", icon, state))
+
+    app._poll_tray_events()
+
+    assert app.root.state() == "normal"
+    assert events.count("deiconify") == 1
+    assert events.count(("warning", "window.tray_unavailable")) == 1
+    assert app._tray_events.empty() is True
 
 
 class ScalarVar:
@@ -351,6 +404,194 @@ class ScalarVar:
 
     def set(self, value) -> None:
         self.value = value
+
+
+class TracedVar(ScalarVar):
+    def __init__(self, value) -> None:
+        super().__init__(value)
+        self.callbacks = []
+
+    def trace_add(self, mode, callback):
+        assert mode == "write"
+        self.callbacks.append(callback)
+
+    def set(self, value) -> None:
+        super().set(value)
+        for callback in self.callbacks:
+            callback("variable", "", "write")
+
+
+@pytest.mark.parametrize(
+    ("dirty_field", "expected_username", "expected_password"),
+    [
+        ("username", "typed-user", "saved-password"),
+        ("password", "saved-user", "typed-password"),
+    ],
+)
+def test_slow_credential_load_preserves_dirty_field_and_populates_untouched(
+    dirty_field,
+    expected_username,
+    expected_password,
+) -> None:
+    from net_connector.app import CredentialLoadOutcome, DesktopApp
+
+    app = DesktopApp.__new__(DesktopApp)
+    app.settings_dialog = SimpleNamespace(winfo_exists=lambda: True)
+    app.username_var = ScalarVar("typed-user" if dirty_field == "username" else "")
+    app.password_var = ScalarVar("typed-password" if dirty_field == "password" else "")
+    app._credential_fields_dirty = {
+        "username": dirty_field == "username",
+        "password": dirty_field == "password",
+    }
+
+    app._handle_credentials_outcome(
+        CredentialLoadOutcome(Credentials("saved-user", "saved-password"))
+    )
+
+    assert app.username_var.get() == expected_username
+    assert app.password_var.get() == expected_password
+
+
+@pytest.mark.parametrize("dirty_field", ["username", "password"])
+def test_credential_write_events_mark_only_the_user_edited_field(dirty_field) -> None:
+    from net_connector.app import CredentialLoadOutcome, DesktopApp
+
+    app = DesktopApp.__new__(DesktopApp)
+    app.settings_dialog = SimpleNamespace(winfo_exists=lambda: True)
+    app.username_var = TracedVar("")
+    app.password_var = TracedVar("")
+    app._credential_fields_dirty = {"username": False, "password": False}
+    app._track_credential_edits()
+
+    edited_var = app.username_var if dirty_field == "username" else app.password_var
+    edited_var.set(f"typed-{dirty_field}")
+    app._handle_credentials_outcome(
+        CredentialLoadOutcome(Credentials("saved-user", "saved-password"))
+    )
+
+    assert app._credential_fields_dirty == {
+        "username": dirty_field == "username",
+        "password": dirty_field == "password",
+    }
+
+
+class FakeSettingsDialog:
+    def __init__(self) -> None:
+        self.exists = True
+        self.released = False
+
+    def winfo_exists(self) -> bool:
+        return self.exists
+
+    def grab_release(self) -> None:
+        self.released = True
+
+    def destroy(self) -> None:
+        self.exists = False
+
+
+def make_save_settings_app(events, *, credential_error=None, settings_error=None):
+    from net_connector.app import DesktopApp
+    from net_connector.i18n import Translator
+    from net_connector.storage import Settings
+
+    class SavingCredentialStore:
+        def __init__(self) -> None:
+            self.saved = []
+
+        def save(self, credentials) -> None:
+            events.append("credentials")
+            if credential_error is not None:
+                raise credential_error
+            self.saved.append(credentials)
+
+    class SavingSettingsStore:
+        def __init__(self) -> None:
+            self.saved = []
+
+        def save(self, settings) -> None:
+            events.append("settings")
+            if settings_error is not None:
+                raise settings_error
+            self.saved.append(settings)
+
+    credential_store = SavingCredentialStore()
+    settings_store = SavingSettingsStore()
+    dialog = FakeSettingsDialog()
+    errors = []
+    app = DesktopApp.__new__(DesktopApp)
+    app.settings = Settings(language="en")
+    app.settings_store = settings_store
+    app.credential_store_factory = lambda: credential_store
+    app.username_var = ScalarVar("  demo-user  ")
+    app.password_var = ScalarVar("save-secret")
+    app.settings_dialog = dialog
+    app._dialog_original_mode = "en"
+    app._dialog_selected_mode = "zh"
+    app._credentials_load_pending = False
+    app.translator = Translator("zh")
+    app._show_error = lambda key, **_kwargs: errors.append(key)
+    app.refresh_text = lambda: events.append("refresh")
+    return app, credential_store, settings_store, dialog, errors
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "expected_events", "expected_error"),
+    [
+        ("credentials", ["credentials"], "error.credential_store"),
+        ("settings", ["credentials", "settings"], "error.settings_save"),
+    ],
+)
+def test_save_settings_failures_are_redacted_and_keep_dialog_state(
+    failure_point,
+    expected_events,
+    expected_error,
+    capsys,
+    caplog,
+) -> None:
+    secret = "backend-save-secret"
+    error = RuntimeError(secret)
+    events = []
+    app, _credential_store, _settings_store, dialog, errors = make_save_settings_app(
+        events,
+        credential_error=error if failure_point == "credentials" else None,
+        settings_error=error if failure_point == "settings" else None,
+    )
+
+    app.save_settings()
+
+    assert events == expected_events
+    assert errors == [expected_error]
+    assert app.settings.language == "en"
+    assert app.translator.language == "zh"
+    assert app._dialog_selected_mode == "zh"
+    assert app.settings_dialog is dialog
+    assert dialog.winfo_exists() is True
+    captured = capsys.readouterr()
+    assert secret not in repr(errors) + captured.out + captured.err + caplog.text
+
+    app.cancel_settings()
+    assert app.translator.language == "en"
+    assert dialog.winfo_exists() is False
+
+
+def test_save_settings_persists_credentials_before_settings_and_closes_dialog() -> None:
+    events = []
+    app, credential_store, settings_store, dialog, errors = make_save_settings_app(events)
+
+    app.save_settings()
+
+    assert events == ["credentials", "settings", "refresh"]
+    assert credential_store.saved == [Credentials("demo-user", "save-secret")]
+    assert settings_store.saved == [app.settings]
+    assert app.settings.language == "zh"
+    assert app.translator.language == "zh"
+    assert app.settings_dialog is None
+    assert app._dialog_original_mode is None
+    assert app._dialog_selected_mode is None
+    assert dialog.released is True
+    assert dialog.winfo_exists() is False
+    assert errors == []
 
 
 def test_apply_schedule_edit_rolls_back_ui_store_and_scheduler(tmp_path, monkeypatch) -> None:
@@ -423,8 +664,15 @@ class HeadlessRoot:
         self.after_calls = []
         self.window_state = "normal"
         self.fail_deiconify = False
+        self.owner_thread = threading.get_ident()
+        self.reject_background_after = False
+        self.background_after_calls = 0
 
     def after(self, delay, callback) -> None:
+        if threading.get_ident() != self.owner_thread:
+            self.background_after_calls += 1
+            if self.reject_background_after:
+                raise RuntimeError("Tk accessed outside owner thread")
         self.after_calls.append((delay, callback))
 
     def withdraw(self) -> None:
@@ -542,6 +790,7 @@ def make_headless_tray_app(events):
     app._tray_available = False
     app._tray_notice_shown = False
     app._tray_states = {}
+    app._tray_events = queue.Queue()
     app.settings_dialog = None
     app.close_hint_label = HeadlessLabel(events)
     app._show_warning = lambda key: events.append(("warning", key))
@@ -576,6 +825,7 @@ def test_tray_readiness_controls_when_window_may_withdraw(monkeypatch) -> None:
     icon._setup_thread.join(timeout=1)
     assert app._tray_available is False
     assert icon.visible is False
+    app._poll_tray_events()
     run_root_callbacks(app.root)
     assert icon.visible is True
     assert app._tray_available is True
@@ -583,6 +833,88 @@ def test_tray_readiness_controls_when_window_may_withdraw(monkeypatch) -> None:
     app.close_window()
     assert events[-1] == "withdraw"
     assert events.count(("warning", "window.tray_unavailable")) == 1
+
+
+def test_xorg_without_tray_manager_never_becomes_available(monkeypatch) -> None:
+    fake_icon_type = install_fake_pystray(monkeypatch)
+    fake_icon_type.__module__ = "pystray._xorg"
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    icon._systray_manager = None
+    try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
+        icon._mark_ready()
+        icon._setup_thread.join(timeout=1)
+        app._poll_tray_events()
+        run_root_callbacks(app.root)
+
+        assert icon.visible is True
+        assert app._tray is None
+        assert app._tray_available is False
+        app.close_window()
+        assert "withdraw" not in events
+    finally:
+        icon.force_release()
+
+
+def test_xorg_tray_manager_loss_before_close_uses_fallback(monkeypatch) -> None:
+    fake_icon_type = install_fake_pystray(monkeypatch)
+    fake_icon_type.__module__ = "pystray._xorg"
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    icon._systray_manager = object()
+    try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
+        icon._mark_ready()
+        icon._setup_thread.join(timeout=1)
+        app._poll_tray_events()
+        assert app._tray_available is True
+
+        icon._systray_manager = None
+        app.close_window()
+
+        assert app._tray is None
+        assert app._tray_available is False
+        assert events == [
+            ("warning", "window.tray_unavailable"),
+            ("label", app.text("window.tray_unavailable")),
+            "iconify",
+        ]
+        assert "withdraw" not in events
+    finally:
+        icon.force_release()
+
+
+@pytest.mark.parametrize("backend_module", ["pystray._win32", "pystray._appindicator"])
+def test_non_xorg_backends_keep_existing_close_behavior(monkeypatch, backend_module) -> None:
+    fake_icon_type = install_fake_pystray(monkeypatch)
+    fake_icon_type.__module__ = backend_module
+    events = []
+    app = make_headless_tray_app(events)
+
+    app._start_tray()
+    icon = app._tray
+    try:
+        assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
+        icon._mark_ready()
+        icon._setup_thread.join(timeout=1)
+        app._poll_tray_events()
+        assert app._tray_available is True
+
+        icon.visible = False
+        app.close_window()
+
+        assert app._tray is icon
+        assert app._tray_available is True
+        assert events == ["withdraw"]
+    finally:
+        icon.force_release()
 
 
 def test_ready_backend_normal_return_disables_tray_withdrawal(monkeypatch) -> None:
@@ -596,12 +928,13 @@ def test_ready_backend_normal_return_disables_tray_withdrawal(monkeypatch) -> No
         assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
         icon._mark_ready()
         icon._setup_thread.join(timeout=1)
-        run_root_callback(app.root, 0)
+        app._poll_tray_events()
         assert app._tray_available is True
 
         icon.finish_backend()
         state = app._tray_states[id(icon)]
         assert state.runner_finished.wait(1) is True
+        app._poll_tray_events()
         run_root_callbacks(app.root)
 
         assert app._tray is None
@@ -623,13 +956,13 @@ def test_close_after_runner_finishes_before_failure_callback_uses_fallback(monke
         assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
         icon._mark_ready()
         icon._setup_thread.join(timeout=1)
-        run_root_callback(app.root, 0)
+        app._poll_tray_events()
         assert app._tray_available is True
 
         icon.finish_backend()
         state = app._tray_states[id(icon)]
         assert state.runner_finished.wait(1) is True
-        assert wait_until(lambda: any(delay == 0 for delay, _callback in app.root.after_calls)) is True
+        assert wait_until(lambda: app._tray_events.empty() is False) is True
 
         app.close_window()
 
@@ -641,11 +974,57 @@ def test_close_after_runner_finishes_before_failure_callback_uses_fallback(monke
         assert app._tray is None
         assert app._tray_available is False
 
+        app._poll_tray_events()
         run_root_callbacks(app.root)
         assert events.count(("warning", "window.tray_unavailable")) == 1
         assert "withdraw" not in events
     finally:
         icon.force_release()
+
+
+@pytest.mark.parametrize("backend_error", [False, True])
+def test_backend_termination_is_queued_without_background_tk_access(backend_error) -> None:
+    from net_connector.app import TrayLifecycle
+
+    class TerminatingIcon:
+        visible = True
+
+        def __init__(self) -> None:
+            self._running = True
+
+        def run(self, *, setup) -> None:
+            if backend_error:
+                raise RuntimeError("backend terminated")
+
+        def stop(self) -> None:
+            self._running = False
+
+    events = []
+    app = make_headless_tray_app(events)
+    app.root.reject_background_after = True
+    app.root.withdraw()
+    events.clear()
+    icon = TerminatingIcon()
+    state = TrayLifecycle()
+    app._tray = icon
+    app._tray_available = True
+    app._tray_states[id(icon)] = state
+    state.runner_thread = threading.Thread(target=app._run_tray_icon, args=(icon, state), daemon=True)
+
+    state.runner_thread.start()
+    state.runner_thread.join(timeout=1)
+
+    assert state.runner_finished.is_set() is True
+    assert app.root.background_after_calls == 0
+    assert app.root.state() == "withdrawn"
+    assert app._tray_events.empty() is False
+
+    app._poll_tray_events()
+
+    assert app.root.state() == "normal"
+    assert events.count("deiconify") == 1
+    assert events.count(("warning", "window.tray_unavailable")) == 1
+    assert app._tray_events.empty() is True
 
 
 def test_hidden_window_is_restored_when_ready_backend_returns(monkeypatch) -> None:
@@ -659,13 +1038,14 @@ def test_hidden_window_is_restored_when_ready_backend_returns(monkeypatch) -> No
         assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
         icon._mark_ready()
         icon._setup_thread.join(timeout=1)
-        run_root_callback(app.root, 0)
+        app._poll_tray_events()
         app.close_window()
         assert app.root.state() == "withdrawn"
 
         icon.finish_backend()
         state = app._tray_states[id(icon)]
         assert state.runner_finished.wait(1) is True
+        app._poll_tray_events()
         run_root_callbacks(app.root)
 
         assert app.root.state() == "normal"
@@ -689,13 +1069,14 @@ def test_hidden_window_is_recoverable_when_ready_backend_raises(monkeypatch) -> 
         assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
         icon._mark_ready()
         icon._setup_thread.join(timeout=1)
-        run_root_callback(app.root, 0)
+        app._poll_tray_events()
         app.close_window()
         app.root.fail_deiconify = True
 
         icon.finish_backend(error=True)
         state = app._tray_states[id(icon)]
         assert state.runner_finished.wait(1) is True
+        app._poll_tray_events()
         run_root_callbacks(app.root)
 
         assert app.root.state() == "iconic"
@@ -720,7 +1101,7 @@ def test_intentional_exit_from_hidden_window_does_not_warn(monkeypatch) -> None:
         assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
         icon._mark_ready()
         icon._setup_thread.join(timeout=1)
-        run_root_callback(app.root, 0)
+        app._poll_tray_events()
         app.close_window()
 
         app.exit()
@@ -742,6 +1123,7 @@ def test_tray_synchronous_startup_failure_never_hides_window(monkeypatch) -> Non
     try:
         state = app._tray_states[id(icon)]
         assert state.runner_finished.wait(1) is True
+        app._poll_tray_events()
         run_root_callbacks(app.root)
         assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
         assert icon._setup_thread.daemon is False
@@ -772,6 +1154,7 @@ def test_tray_setup_menu_failure_never_marks_ready(monkeypatch) -> None:
     assert "withdraw" not in events
     icon._mark_ready()
     icon._setup_thread.join(timeout=1)
+    app._poll_tray_events()
     run_root_callbacks(app.root)
 
     assert app._tray is None
@@ -791,6 +1174,7 @@ def test_tray_pre_readiness_backend_death_is_timed_out_and_joined(monkeypatch) -
     try:
         assert wait_until(lambda: icon._setup_thread is not None and icon._setup_thread.ident is not None) is True
         assert icon._setup_thread.is_alive() is True
+        app._poll_tray_events()
         run_root_callbacks(app.root)
 
         assert app._tray is None
@@ -947,7 +1331,7 @@ def test_watchdog_honors_backend_readiness_before_tk_callback(monkeypatch) -> No
 
         assert app._tray is icon
         assert icon.stopped is False
-        run_root_callback(app.root, 0)
+        app._poll_tray_events()
         assert app._tray_available is True
     finally:
         icon.emergency_cleanup()

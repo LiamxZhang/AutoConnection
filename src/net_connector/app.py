@@ -167,14 +167,6 @@ def persist_schedule(settings_store, settings: Settings, enabled: bool, schedule
     return updated, scheduler if enabled else None
 
 
-def marshal_to_tk(root, callback):
-    """Wrap a foreign-thread callback so it only schedules Tk-thread work."""
-    def marshaled(*_args, **_kwargs):
-        root.after(0, callback)
-
-    return marshaled
-
-
 def set_accessible_name(widget, name: str) -> None:
     """Attach localized accessibility metadata for adapters and tests."""
     # Tk has no cross-platform accessible-name option; retain explicit metadata for platform adapters.
@@ -265,10 +257,13 @@ class DesktopApp:
         self._tray_notice_shown = False
         self._tray_requested = enable_tray
         self._tray_states = {}
+        self._tray_events = queue.Queue()
         self.settings_dialog = None
         self._dialog_original_mode = None
         self._dialog_selected_mode = None
         self._credentials_load_pending = False
+        self._credential_fields_dirty = {"username": False, "password": False}
+        self._applying_loaded_credentials = False
 
         self._configure_root()
         self._configure_styles()
@@ -429,6 +424,9 @@ class DesktopApp:
     def _poll_worker_queue(self) -> None:
         if self._exiting:
             return
+        self._poll_tray_events()
+        if self._exiting:
+            return
         while True:
             item = self.worker.take_result()
             if item is None:
@@ -445,6 +443,28 @@ class DesktopApp:
             if dialog is not None and dialog.winfo_exists() and self.worker.start_credentials_load():
                 self._credentials_load_pending = False
         self.root.after(75, self._poll_worker_queue)
+
+    def _poll_tray_events(self) -> None:
+        while not getattr(self, "_exiting", False):
+            try:
+                event, icon, state = self._tray_events.get_nowait()
+            except queue.Empty:
+                return
+            if event == "ready":
+                self._complete_tray_ready(icon, state)
+            elif event == "failed":
+                self._finish_tray_failure(icon, wait_for_backend=False)
+            elif event == "callback":
+                try:
+                    icon()
+                except Exception:
+                    pass
+
+    def _queue_tray_callback(self, callback):
+        def queued(*_args, **_kwargs):
+            self._tray_events.put(("callback", callback, None))
+
+        return queued
 
     def _handle_status_outcome(self, online: bool) -> None:
         self.last_check = self.now_provider()
@@ -469,8 +489,23 @@ class DesktopApp:
             self._show_error("error.credential_store", parent=self.settings_dialog)
             return
         if outcome.credentials is not None:
-            self.username_var.set(outcome.credentials.username)
-            self.password_var.set(outcome.credentials.password)
+            self._applying_loaded_credentials = True
+            try:
+                if not self._credential_fields_dirty["username"]:
+                    self.username_var.set(outcome.credentials.username)
+                if not self._credential_fields_dirty["password"]:
+                    self.password_var.set(outcome.credentials.password)
+            finally:
+                self._applying_loaded_credentials = False
+
+    def _track_credential_edits(self) -> None:
+        self._applying_loaded_credentials = False
+        self.username_var.trace_add("write", lambda *_args: self._mark_credential_field_dirty("username"))
+        self.password_var.trace_add("write", lambda *_args: self._mark_credential_field_dirty("password"))
+
+    def _mark_credential_field_dirty(self, field: str) -> None:
+        if not self._applying_loaded_credentials:
+            self._credential_fields_dirty[field] = True
 
     def _poll_schedule(self) -> None:
         if self._exiting:
@@ -522,6 +557,7 @@ class DesktopApp:
             return
         self._dialog_original_mode = self.settings.language
         self._dialog_selected_mode = self.settings.language
+        self._credential_fields_dirty = {"username": False, "password": False}
         dialog = tk.Toplevel(self.root)
         self.settings_dialog = dialog
         dialog.geometry("420x340")
@@ -543,6 +579,7 @@ class DesktopApp:
         self.password_var = tk.StringVar()
         self.password_entry = ttk.Entry(body, textvariable=self.password_var, show="•")
         self.password_entry.grid(row=1, column=1, sticky="ew", pady=(0, 12))
+        self._track_credential_edits()
         self.show_password_button = ttk.Button(body, width=9, command=self._toggle_password)
         self.show_password_button.grid(row=1, column=2, padx=(8, 0), pady=(0, 12))
         self.credential_hint_label = ttk.Label(body, foreground="#68736e")
@@ -684,20 +721,14 @@ class DesktopApp:
         finally:
             state.runner_finished.set()
         if not state.cancelled.is_set():
-            try:
-                self.root.after(0, lambda: self._finish_tray_failure(icon, wait_for_backend=False))
-            except Exception:
-                self._finish_tray_failure(icon, wait_for_backend=False, recover_hidden_window=False)
+            self._tray_events.put(("failed", icon, state))
 
     def _on_tray_ready(self, icon) -> None:
         state = self._tray_states.get(id(icon))
         if state is None or state.cancelled.is_set():
             return
         state.backend_ready.set()
-        try:
-            self.root.after(0, lambda: self._complete_tray_ready(icon, state))
-        except Exception:
-            self._finish_tray_failure(icon)
+        self._tray_events.put(("ready", icon, state))
 
     def _complete_tray_ready(self, icon, state: TrayLifecycle) -> None:
         if state.cancelled.is_set() or icon is not self._tray or self._exiting:
@@ -708,7 +739,17 @@ class DesktopApp:
         except Exception:
             self._finish_tray_failure(icon)
             return
+        if not self._tray_icon_is_usable(icon):
+            self._finish_tray_failure(icon)
+            return
         self._finish_tray_ready(icon)
+
+    @staticmethod
+    def _tray_icon_is_usable(icon) -> bool:
+        # pystray 0.19.5 Xorg records visible=True even when no tray manager accepts the icon.
+        if type(icon).__module__ == "pystray._xorg":
+            return getattr(icon, "_systray_manager", None) is not None
+        return True
 
     def _expire_tray_startup(self, icon) -> None:
         state = self._tray_states.get(id(icon))
@@ -824,9 +865,9 @@ class DesktopApp:
 
         icon.title = self.text("app.title")
         icon.menu = pystray.Menu(
-            pystray.MenuItem(self.text("tray.show"), marshal_to_tk(self.root, self.show_window), default=True),
-            pystray.MenuItem(self.text("tray.connect"), marshal_to_tk(self.root, self.start_connection)),
-            pystray.MenuItem(self.text("tray.exit"), marshal_to_tk(self.root, self.exit)),
+            pystray.MenuItem(self.text("tray.show"), self._queue_tray_callback(self.show_window), default=True),
+            pystray.MenuItem(self.text("tray.connect"), self._queue_tray_callback(self.start_connection)),
+            pystray.MenuItem(self.text("tray.exit"), self._queue_tray_callback(self.exit)),
         )
         if update_backend:
             icon.update_menu()
@@ -848,7 +889,8 @@ class DesktopApp:
         icon = self._tray
         state = self._tray_states.get(id(icon)) if icon is not None else None
         runner_finished = state is not None and state.runner_finished.is_set()
-        if self._tray_available and not runner_finished:
+        tray_usable = self._tray_icon_is_usable(icon) if self._tray_available else False
+        if self._tray_available and not runner_finished and tray_usable:
             self.root.withdraw()
             return
         if self._tray_available:
