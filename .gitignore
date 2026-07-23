@@ -2,10 +2,12 @@
 .worktrees/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .coverage
 htmlcov/
 .venv/
+.venv-build/
 build/
 dist/
 *.spec
