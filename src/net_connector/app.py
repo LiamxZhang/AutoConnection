@@ -162,6 +162,12 @@ def marshal_to_tk(root, callback):
     return marshaled
 
 
+def set_accessible_name(widget, name: str) -> None:
+    """Attach localized accessibility metadata for adapters and tests."""
+    # Tk has no cross-platform accessible-name option; retain explicit metadata for platform adapters.
+    widget.accessible_name = name
+
+
 class Tooltip:
     """Small hover tooltip for an icon-only control."""
 
@@ -171,6 +177,8 @@ class Tooltip:
         self._window = None
         widget.bind("<Enter>", self._show, add=True)
         widget.bind("<Leave>", self._hide, add=True)
+        widget.bind("<FocusIn>", self._show, add=True)
+        widget.bind("<FocusOut>", self._hide, add=True)
 
     def _show(self, _event=None) -> None:
         if self._window is not None:
@@ -353,6 +361,7 @@ class DesktopApp:
     def refresh_text(self) -> None:
         self.root.title(self.text("app.title"))
         self.title_label.configure(text=self.text("app.title"))
+        set_accessible_name(self.settings_button, self.text("tooltip.settings"))
         self.connect_button.configure(text=self.text("action.retry" if self._failed else "action.connect"))
         self.schedule_checkbutton.configure(text=self.text("schedule.title"))
         self.schedule_every_label.configure(text=self.text("schedule.every_day"))
@@ -627,6 +636,7 @@ class DesktopApp:
     def _start_tray(self) -> None:
         if self._exiting or not self._tray_requested:
             return
+        icon = None
         try:
             import pystray
             from PIL import Image, ImageDraw
@@ -635,31 +645,65 @@ class DesktopApp:
             draw = ImageDraw.Draw(image)
             draw.ellipse((9, 9, 55, 55), fill="#176b4d")
             draw.ellipse((25, 25, 39, 39), fill="#ffffff")
-            self._tray = pystray.Icon("net-connector", image, self.text("app.title"))
-            self._refresh_tray()
-            self._tray.run_detached()
-            self._tray_available = True
+            icon = pystray.Icon("net-connector", image, self.text("app.title"))
+            self._tray = icon
+            self._configure_tray(icon, update_backend=False)
+            icon.run_detached(setup=self._on_tray_ready)
         except Exception:
-            self._tray = None
-            self._tray_available = False
+            self._finish_tray_failure(icon)
 
-    def _refresh_tray(self) -> None:
-        if self._tray is None:
+    def _on_tray_ready(self, icon) -> None:
+        try:
+            if icon is not self._tray:
+                raise RuntimeError("Tray startup was superseded.")
+            self._configure_tray(icon, update_backend=True)
+            icon.visible = True
+        except Exception:
+            self.root.after(0, lambda: self._finish_tray_failure(icon))
+            return
+        self.root.after(0, lambda: self._finish_tray_ready(icon))
+
+    def _finish_tray_ready(self, icon) -> None:
+        if self._exiting or icon is not self._tray:
+            self._stop_tray(icon)
+            return
+        self._tray_available = True
+
+    def _finish_tray_failure(self, icon) -> None:
+        if icon is self._tray:
+            self._tray = None
+        self._tray_available = False
+        self._stop_tray(icon)
+
+    @staticmethod
+    def _stop_tray(icon) -> None:
+        if icon is None:
             return
         try:
-            import pystray
-
-            self._tray.title = self.text("app.title")
-            self._tray.menu = pystray.Menu(
-                pystray.MenuItem(self.text("tray.show"), marshal_to_tk(self.root, self.show_window), default=True),
-                pystray.MenuItem(self.text("tray.connect"), marshal_to_tk(self.root, self.start_connection)),
-                pystray.MenuItem(self.text("tray.exit"), marshal_to_tk(self.root, self.exit)),
-            )
-            update_menu = getattr(self._tray, "update_menu", None)
-            if callable(update_menu):
-                update_menu()
+            icon.stop()
         except Exception:
-            self._tray_available = False
+            pass
+
+    def _configure_tray(self, icon, *, update_backend: bool) -> None:
+        import pystray
+
+        icon.title = self.text("app.title")
+        icon.menu = pystray.Menu(
+            pystray.MenuItem(self.text("tray.show"), marshal_to_tk(self.root, self.show_window), default=True),
+            pystray.MenuItem(self.text("tray.connect"), marshal_to_tk(self.root, self.start_connection)),
+            pystray.MenuItem(self.text("tray.exit"), marshal_to_tk(self.root, self.exit)),
+        )
+        if update_backend:
+            icon.update_menu()
+
+    def _refresh_tray(self) -> None:
+        icon = self._tray
+        if icon is None:
+            return
+        try:
+            self._configure_tray(icon, update_backend=self._tray_available)
+        except Exception:
+            self._finish_tray_failure(icon)
 
     def show_window(self) -> None:
         self.root.deiconify()
@@ -669,10 +713,11 @@ class DesktopApp:
         if self._tray_available:
             self.root.withdraw()
             return
-        self.root.iconify()
         if not self._tray_notice_shown:
             self._tray_notice_shown = True
+            self._show_warning("window.tray_unavailable")
             self.close_hint_label.configure(text=self.text("window.tray_unavailable"))
+        self.root.iconify()
 
     def exit(self) -> None:
         if self._exiting:
