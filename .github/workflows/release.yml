@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build release (${{ matrix.platform }})
@@ -75,6 +79,9 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Download release binaries
         uses: actions/download-artifact@v4
@@ -87,15 +94,30 @@ jobs:
         working-directory: release-assets
         run: sha256sum WorkNetConnector-windows-x86_64.exe WorkNetConnector-linux-x86_64 > SHA256SUMS.txt
 
-      - name: Publish one release
+      - name: Ensure release exists
         working-directory: release-assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME"
-          WorkNetConnector-windows-x86_64.exe
-          WorkNetConnector-linux-x86_64
-          SHA256SUMS.txt
-          --title "$GITHUB_REF_NAME"
-          --generate-notes
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+
+      - name: Synchronize release assets
+        working-directory: release-assets
+        run: |
+          asset_names="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"
+          while IFS= read -r asset; do
+            [[ -z "$asset" ]] && continue
+            case "$asset" in
+              WorkNetConnector-windows-x86_64.exe|WorkNetConnector-linux-x86_64|SHA256SUMS.txt) ;;
+              *) gh release delete-asset "$GITHUB_REF_NAME" "$asset" --yes ;;
+            esac
+          done <<< "$asset_names"
+          gh release upload "$GITHUB_REF_NAME" \
+            WorkNetConnector-windows-x86_64.exe \
+            WorkNetConnector-linux-x86_64 \
+            SHA256SUMS.txt \
+            --clobber
+
+      - name: Publish release
+        working-directory: release-assets
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --title "$GITHUB_REF_NAME"

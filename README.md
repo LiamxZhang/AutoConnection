@@ -1,6 +1,6 @@
 # 工作网络连接器 / WorkNetConnector
 
-工作网络连接器是一个便携式桌面程序，用于手动或每日一次连接兼容的工作网络门户。项目仅支持 Windows 10/11 x64 和 Linux x86_64；每个平台发布一个无需安装的单文件程序。
+工作网络连接器是一个便携式桌面程序，用于手动或每日一次连接兼容的工作网络门户。项目支持 Windows 10/11 x64，以及兼容 Ubuntu 22.04 的、基于 glibc 的 x86_64 桌面 Linux；每个平台发布一个无需安装的单文件程序。旧版 glibc 或非 glibc 发行版不保证兼容。
 
 ## 下载与运行
 
@@ -63,7 +63,7 @@ bash ./scripts/build.sh
 
 ## English
 
-WorkNetConnector is a portable, one-file desktop connector for Windows 10/11 x64 and Linux x86_64. Download the platform binary from GitHub Releases, verify it against `SHA256SUMS.txt`, and run it without an installer.
+WorkNetConnector is a portable, one-file desktop connector for Windows 10/11 x64 and Ubuntu 22.04-compatible, glibc-based x86_64 desktop Linux. Older glibc and non-glibc distributions are not guaranteed to work. Download the platform binary from GitHub Releases, verify it against `SHA256SUMS.txt`, and run it without an installer.
 
 On first run, open the gear settings and save the network username and password. Credentials are stored only in the operating-system keyring, with no plaintext fallback. Linux requires an available, unlocked Secret Service provider. Manual Connect and one daily `HH:MM` schedule are supported while the app or tray process remains running; a sleep-missed run is caught up once, but closed-app runs are not. Tray-unavailable desktops fall back to the taskbar/window. VPN messages are probabilistic diagnostics, not proof.
 

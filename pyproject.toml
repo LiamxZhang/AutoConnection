@@ -19,6 +19,7 @@ dev = [
     "pytest>=8,<9",
     "pytest-cov>=6,<7",
     "pyinstaller>=6.14,<7",
+    "ruamel.yaml>=0.18,<0.19",
     "tzdata>=2025.2,<2027",
 ]
 

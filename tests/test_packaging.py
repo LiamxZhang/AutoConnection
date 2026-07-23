@@ -7,8 +7,10 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tomllib
 
 import pytest
+from ruamel.yaml import YAML
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +37,24 @@ PYINSTALLER_ARGUMENTS = (
 
 def read_file(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def load_workflow(path: Path):
+    yaml = YAML(typ="rt")
+    yaml.version = (1, 2)
+    workflow = yaml.load(read_file(path))
+    assert "on" in workflow
+    return workflow
+
+
+def workflow_step(job, name: str):
+    matches = [step for step in job["steps"] if step.get("name") == name]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def workflow_runs(job) -> list[str]:
+    return [step["run"] for step in job["steps"] if "run" in step]
 
 
 def target_metadata() -> dict[str, tuple[bool, int | None]]:
@@ -192,59 +212,187 @@ def test_build_virtual_environment_is_ignored() -> None:
     assert ".venv-build/" in read_file(REPOSITORY_ROOT / ".gitignore").splitlines()
 
 
-def test_ci_workflow_builds_and_uploads_each_supported_platform() -> None:
-    workflow = read_file(CI_WORKFLOW)
+def test_dev_dependencies_include_yaml_1_2_parser() -> None:
+    project = tomllib.loads(read_file(REPOSITORY_ROOT / "pyproject.toml"))
 
-    assert re.search(r"(?m)^on:\s*$", workflow)
-    assert re.search(r"(?m)^  push:\s*$", workflow)
-    assert re.search(r"(?m)^  pull_request:\s*$", workflow)
-    assert "contents: read" in workflow
-    assert "windows-latest" in workflow
-    assert "ubuntu-22.04" in workflow
-    assert 'python-version: "3.12"' in workflow
-    assert "python3-tk" in workflow
-    assert "xvfb" in workflow
-    assert "scripts/build.ps1" in workflow
-    assert "xvfb-run -a bash scripts/build.sh" in workflow
-    assert "actions/checkout@v4" in workflow
-    assert "actions/setup-python@v5" in workflow
-    assert "actions/upload-artifact@v4" in workflow
-    assert "WorkNetConnector-windows-x86_64-ci" in workflow
-    assert "WorkNetConnector-linux-x86_64-ci" in workflow
-    assert "dist/WorkNetConnector.exe" in workflow
-    assert "dist/WorkNetConnector" in workflow
+    assert any(
+        dependency.startswith("ruamel.yaml")
+        for dependency in project["project"]["optional-dependencies"]["dev"]
+    )
+
+
+def test_ci_workflow_builds_and_uploads_each_supported_platform() -> None:
+    workflow = load_workflow(CI_WORKFLOW)
+
+    assert workflow["on"] == {
+        "push": {"branches": ["main"]},
+        "pull_request": None,
+    }
+    assert workflow["permissions"] == {"contents": "read"}
+    assert set(workflow["jobs"]) == {"build"}
+    build = workflow["jobs"]["build"]
+    assert build["strategy"]["fail-fast"] is False
+    assert build["strategy"]["matrix"]["include"] == [
+        {
+            "platform": "windows-x86_64",
+            "os": "windows-latest",
+            "artifact": "WorkNetConnector-windows-x86_64-ci",
+            "executable": "dist/WorkNetConnector.exe",
+        },
+        {
+            "platform": "linux-x86_64",
+            "os": "ubuntu-22.04",
+            "artifact": "WorkNetConnector-linux-x86_64-ci",
+            "executable": "dist/WorkNetConnector",
+        },
+    ]
+    assert workflow_step(build, "Set up Python 3.12")["with"]["python-version"] == "3.12"
+    linux_dependencies = workflow_step(build, "Install Linux desktop build dependencies")["run"]
+    assert "python3-tk" in linux_dependencies and "xvfb" in linux_dependencies
+    assert workflow_step(build, "Install, test, and build on Windows")["run"].endswith(
+        "scripts/build.ps1"
+    )
+    assert workflow_step(build, "Install, test, and build on Linux")["run"] == (
+        "xvfb-run -a bash scripts/build.sh"
+    )
+    upload = workflow_step(build, "Upload portable executable")["with"]
+    assert upload["name"] == "${{ matrix.artifact }}"
+    assert upload["path"] == "${{ matrix.executable }}"
     # Platform scripts own dependency installation and the single complete test run.
-    assert "python -m pytest" not in workflow
+    assert all("python -m pytest" not in command for command in workflow_runs(build))
+
+
+def test_official_actions_use_expected_major_refs_until_shas_can_be_resolved() -> None:
+    expected_majors = {
+        "actions/checkout": "v4",
+        "actions/setup-python": "v5",
+        "actions/upload-artifact": "v4",
+        "actions/download-artifact": "v4",
+    }
+    observed = set()
+
+    for path in (CI_WORKFLOW, RELEASE_WORKFLOW):
+        workflow = load_workflow(path)
+        for job in workflow["jobs"].values():
+            for step in job["steps"]:
+                uses = step.get("uses")
+                if not uses or not uses.startswith("actions/"):
+                    continue
+                repository, reference = uses.split("@", 1)
+                assert repository in expected_majors
+                assert reference == expected_majors[repository]
+                observed.add(repository)
+
+    assert observed == set(expected_majors)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "official action tag SHAs unresolved: two bounded git ls-remote attempts "
+        "could not connect to github.com:443"
+    ),
+)
+def test_official_actions_are_pinned_to_commented_commit_shas() -> None:
+    expected_majors = {
+        "actions/checkout": "v4",
+        "actions/setup-python": "v5",
+        "actions/upload-artifact": "v4",
+        "actions/download-artifact": "v4",
+    }
+    observed = set()
+
+    for path in (CI_WORKFLOW, RELEASE_WORKFLOW):
+        workflow = load_workflow(path)
+        for job in workflow["jobs"].values():
+            for step in job["steps"]:
+                uses = step.get("uses")
+                if not uses or not uses.startswith("actions/"):
+                    continue
+                repository, reference = uses.split("@", 1)
+                assert repository in expected_majors
+                assert re.fullmatch(r"[0-9a-f]{40}", reference)
+                comment_items = step.ca.items.get("uses")
+                comment = comment_items[2].value.strip() if comment_items and comment_items[2] else ""
+                major = expected_majors[repository]
+                assert re.fullmatch(
+                    rf"#\s*{re.escape(repository)}\s+{major}(?:\.\d+\.\d+)?",
+                    comment,
+                )
+                observed.add(repository)
+
+    assert observed == set(expected_majors)
 
 
 def test_release_workflow_publishes_one_release_with_exact_checksums() -> None:
-    workflow = read_file(RELEASE_WORKFLOW)
+    workflow = load_workflow(RELEASE_WORKFLOW)
 
-    assert re.search(r"(?m)^on:\s*$", workflow)
-    assert re.search(r"(?m)^    tags:\s*$", workflow)
-    assert re.search(r"(?m)^      - ['\"]v\*['\"]\s*$", workflow)
-    assert "windows-latest" in workflow
-    assert "ubuntu-22.04" in workflow
-    assert 'python-version: "3.12"' in workflow
-    assert "python3-tk" in workflow and "xvfb" in workflow
-    assert "scripts/build.ps1" in workflow
-    assert "xvfb-run -a bash scripts/build.sh" in workflow
-    assert "WorkNetConnector-windows-x86_64.exe" in workflow
-    assert "WorkNetConnector-linux-x86_64" in workflow
-    assert "actions/upload-artifact@v4" in workflow
-    assert "actions/download-artifact@v4" in workflow
-    assert "merge-multiple: true" in workflow
-    assert "needs: build" in workflow
-    assert "contents: write" in workflow
-    assert "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" in workflow
-    assert "GH_REPO: ${{ github.repository }}" in workflow
-    assert workflow.count("gh release create") == 1
-    checksum_command = (
+    assert workflow["on"] == {"push": {"tags": ["v*"]}}
+    assert workflow["permissions"] == {"contents": "read"}
+    assert workflow["concurrency"] == {
+        "group": "release-${{ github.ref }}",
+        "cancel-in-progress": False,
+    }
+    assert set(workflow["jobs"]) == {"build", "publish"}
+    build = workflow["jobs"]["build"]
+    publish = workflow["jobs"]["publish"]
+    assert build["strategy"]["matrix"]["include"] == [
+        {
+            "platform": "windows-x86_64",
+            "os": "windows-latest",
+            "artifact": "release-windows-x86_64",
+            "release_path": "release-assets/WorkNetConnector-windows-x86_64.exe",
+        },
+        {
+            "platform": "linux-x86_64",
+            "os": "ubuntu-22.04",
+            "artifact": "release-linux-x86_64",
+            "release_path": "release-assets/WorkNetConnector-linux-x86_64",
+        },
+    ]
+    assert all("gh release" not in command for command in workflow_runs(build))
+    assert publish["needs"] == "build"
+    assert "strategy" not in publish
+    assert publish["permissions"] == {"contents": "write"}
+    assert publish["env"] == {
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "GH_REPO": "${{ github.repository }}",
+    }
+
+    download = workflow_step(publish, "Download release binaries")["with"]
+    assert download == {
+        "pattern": "release-*",
+        "path": "release-assets",
+        "merge-multiple": True,
+    }
+    checksum = workflow_step(publish, "Create checksum manifest")["run"]
+    assert checksum == (
         "sha256sum WorkNetConnector-windows-x86_64.exe "
         "WorkNetConnector-linux-x86_64 > SHA256SUMS.txt"
     )
-    assert checksum_command in workflow
-    assert "SHA256SUMS.txt" in workflow
+
+    ensure = workflow_step(publish, "Ensure release exists")["run"]
+    assert 'if ! gh release view "$GITHUB_REF_NAME"' in ensure
+    assert 'gh release create "$GITHUB_REF_NAME"' in ensure
+    assert "--draft" in ensure
+    synchronize = workflow_step(publish, "Synchronize release assets")["run"]
+    for filename in (
+        "WorkNetConnector-windows-x86_64.exe",
+        "WorkNetConnector-linux-x86_64",
+        "SHA256SUMS.txt",
+    ):
+        assert filename in synchronize
+    assert "gh release delete-asset" in synchronize
+    assert "gh release upload" in synchronize
+    assert "--clobber" in synchronize
+    publish_step = workflow_step(publish, "Publish release")["run"]
+    assert 'gh release edit "$GITHUB_REF_NAME"' in publish_step
+    assert "--draft=false" in publish_step
+
+    publish_commands = "\n".join(workflow_runs(publish))
+    assert publish_commands.count("gh release create") == 1
+    assert publish_commands.count("gh release upload") == 1
+    assert publish_commands.count("gh release edit") == 1
 
 
 def test_readme_documents_safe_portable_operation_and_development() -> None:
@@ -253,7 +401,8 @@ def test_readme_documents_safe_portable_operation_and_development() -> None:
     assert readme.startswith("# 工作网络连接器")
     for phrase in (
         "Windows 10/11 x64",
-        "Linux x86_64",
+        "兼容 Ubuntu 22.04 的、基于 glibc 的 x86_64 桌面 Linux",
+        "旧版 glibc 或非 glibc 发行版不保证兼容",
         "WorkNetConnector-windows-x86_64.exe",
         "WorkNetConnector-linux-x86_64",
         "系统密钥环",
@@ -274,5 +423,7 @@ def test_readme_documents_safe_portable_operation_and_development() -> None:
         "不会自动启动",
         "进程保持运行",
         "## English",
+        "Ubuntu 22.04-compatible, glibc-based x86_64 desktop Linux",
+        "Older glibc and non-glibc distributions are not guaranteed",
     ):
         assert phrase in readme
