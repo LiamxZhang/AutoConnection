@@ -84,6 +84,8 @@ def event(kind, **values):
 
 
 if args[:2] == ["release", "view"]:
+    if "--json" in args and state["release"] is not None:
+        sys.stdout.write("1001\n")
     save()
     raise SystemExit(0 if state["release"] is not None else 1)
 
@@ -122,6 +124,10 @@ if args and args[0] == "api":
         event("delete", id=numeric_id)
         save()
         raise SystemExit(0)
+    endpoint = next((value for value in args[1:] if value.startswith("repos/")), "")
+    if "/releases/tags/" in endpoint and state["release"] == "draft":
+        save()
+        raise SystemExit("gh: Not Found (HTTP 404)")
     rows = "".join(f'{asset["id"]}\t{asset["name"]}\n' for asset in state["assets"])
     sys.stdout.buffer.write(rows.encode("utf-8"))
     save()
@@ -411,6 +417,14 @@ def test_dev_dependencies_include_yaml_1_2_parser() -> None:
     )
 
 
+def test_current_release_version_is_0_1_1() -> None:
+    project = tomllib.loads(read_file(REPOSITORY_ROOT / "pyproject.toml"))
+    package_init = read_file(REPOSITORY_ROOT / "src" / "net_connector" / "__init__.py")
+
+    assert project["project"]["version"] == "0.1.1"
+    assert '__version__ = "0.1.1"' in package_init
+
+
 def test_ci_workflow_builds_and_uploads_each_supported_platform() -> None:
     workflow = load_workflow(CI_WORKFLOW)
 
@@ -567,7 +581,13 @@ def test_release_workflow_publishes_one_release_with_exact_checksums() -> None:
     assert "--draft" in synchronize
     draft_transition = 'gh release edit "$GITHUB_REF_NAME" --draft=true'
     assert draft_transition in synchronize
-    assert synchronize.index(draft_transition) < synchronize.index("gh api")
+    release_id_lookup = (
+        'gh release view "$GITHUB_REF_NAME" --json databaseId --jq \'.databaseId\''
+    )
+    assert release_id_lookup in synchronize
+    assert synchronize.index(draft_transition) < synchronize.index(release_id_lookup)
+    assert 'repos/$GH_REPO/releases/$release_id' in synchronize
+    assert 'repos/$GH_REPO/releases/tags/$GITHUB_REF_NAME' not in synchronize
     assert "[0-9]+" in synchronize
     assert 'gh api --method DELETE "repos/$GH_REPO/releases/assets/$asset_id"' in synchronize
     assert "gh release delete-asset" not in synchronize
