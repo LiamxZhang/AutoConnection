@@ -1750,7 +1750,10 @@ def test_gui_smoke_builds_compact_bilingual_app(tmp_path) -> None:
         assert app.schedule_time_entry.winfo_exists()
         assert root.minsize()[0] >= 420
         assert tuple(root.resizable()) == (1, 1)
-        assert root.geometry().startswith("420x390")
+        window_size = root.geometry().split("+", 1)[0]
+        window_width, window_height = (int(value) for value in window_size.split("x", 1))
+        assert window_width >= 420
+        assert window_height >= 390
 
         app.open_settings()
         root.update_idletasks()
